@@ -1,0 +1,42 @@
+{
+  "name": "email-parser-backend",
+  "version": "1.0.0",
+  "description": "Email intelligence backend using Unipile and Firestore",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "nodemon src/server.js",
+    "local": "node scripts/start-local.js",
+    "start": "node src/server.js",
+    "check": "node --check src/server.js && node --check src/app.js && node --check src/controllers/account.controller.js && node --check src/controllers/config.controller.js && node --check src/controllers/email.controller.js && node --check src/controllers/forwarding.controller.js && node --check src/controllers/webhook.controller.js && node --check src/middlewares/auth.middleware.js && node --check src/routes/connection.routes.js && node --check src/routes/forwarding.routes.js && node --check src/routes/webhook.routes.js && node --check src/services/account.service.js && node --check src/services/cpanel.service.js && node --check src/services/email.service.js && node --check src/services/forwarding.service.js && node --check src/services/parser.service.js && node --check src/extractors/emailExtractor.js && node --check src/services/unipile.service.js && node --check src/services/firebase.service.js && node --check src/utils/credentialCipher.js && node --check public/client.js",
+    "diagnose": "node scripts/diagnose-extractor.js",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "keywords": [
+    "node",
+    "express",
+    "unipile",
+    "email",
+    "parser",
+    "backend"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.11.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "firebase-admin": "^14.1.0",
+    "helmet": "^8.1.0",
+    "imapflow": "^1.6.5",
+    "mailparser": "^3.9.14",
+    "morgan": "^1.10.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}

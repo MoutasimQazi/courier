@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Connect a mailbox and extract order and subscription intelligence." />
+    <title>Inbox Signal — Email Intelligence</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script type="module" src="/client.js"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div class="brand-row">
+          <span class="brand-mark" aria-hidden="true">IS</span>
+          <span class="brand-name">Inbox Signal</span>
+          <span class="status-pill"><i></i> Secure mailbox intelligence</span>
+        </div>
+        <p class="eyebrow">EMAIL INTELLIGENCE</p>
+        <h1>Turn a noisy inbox into<br /><span>useful JSON.</span></h1>
+        <p class="intro">Securely connect Gmail or Outlook and extract only courier and subscription signals.</p>
+      </header>
+
+      <section id="app-view" class="workspace" aria-labelledby="workspace-title" hidden>
+        <div class="form-panel">
+          <div class="account-header">
+            <div>
+              <p class="step">01 · CONNECTED MAILBOXES</p>
+              <h2 id="workspace-title">Your mailbox</h2>
+            </div>
+            <button id="sign-out-button" class="text-button" type="button">Reset session</button>
+          </div>
+          <p id="signed-in-email" class="muted"></p>
+
+          <div id="account-list" class="account-list" aria-live="polite"></div>
+          <p id="connection-message" class="field-error" role="status"></p>
+
+          <div class="button-stack">
+            <button id="connect-button" type="button">Connect Gmail or Outlook <span aria-hidden="true">→</span></button>
+            <button id="fetch-button" class="secondary-button" type="button" disabled>
+              <span class="button-label">Fetch intelligence</span>
+            </button>
+          </div>
+
+          <section class="forwarding-test" aria-labelledby="forwarding-title">
+            <p class="step">CPANEL AUTOFORWARDING TEST</p>
+            <h3 id="forwarding-title">Forwarding address</h3>
+            <p id="forwarding-address" class="muted">Checking your forwarding mailbox...</p>
+            <div class="button-stack">
+              <button id="forwarding-enable-button" type="button">Create forwarding address <span aria-hidden="true">→</span></button>
+              <button id="forwarding-verification-button" class="secondary-button" type="button" disabled>Check Gmail verification</button>
+              <button id="forwarding-sync-button" class="secondary-button" type="button" disabled>Sync forwarded emails</button>
+              <button id="forwarding-delete-button" class="danger-button" type="button" disabled>Remove test address</button>
+            </div>
+            <p id="forwarding-message" class="field-error" role="status"></p>
+            <div id="forwarding-verification-result" class="verification-result" hidden></div>
+          </section>
+
+          <div class="privacy-note">
+            <span aria-hidden="true">✓</span>
+            <p><strong>Private session</strong><br />Local testing uses a stable internal identity; production requests use the verified Firebase UID.</p>
+          </div>
+        </div>
+
+        <div class="result-panel">
+          <div class="result-header">
+            <div>
+              <p class="step">02 · STRUCTURED OUTPUT</p>
+              <h2>JSON response</h2>
+            </div>
+            <button id="copy-button" class="copy-button" type="button" disabled>Copy JSON</button>
+          </div>
+
+          <div id="summary" class="summary" hidden>
+            <div><span id="order-count">0</span><small>Orders</small></div>
+            <div><span id="subscription-count">0</span><small>Subscriptions</small></div>
+          </div>
+
+          <div id="empty-state" class="empty-state">
+            <div class="empty-icon" aria-hidden="true">{ }</div>
+            <h3>Your results will appear here</h3>
+            <p>Connect a mailbox, then fetch intelligence to see clean structured JSON.</p>
+          </div>
+
+          <div id="loading-state" class="loading-state" hidden aria-live="polite">
+            <div class="loader"></div>
+            <p>Reading useful signals…</p>
+          </div>
+
+          <div id="error-state" class="error-state" hidden role="alert"></div>
+          <pre id="json-output" hidden><code></code></pre>
+        </div>
+      </section>
+
+      <footer>
+        <span>Private session → Unipile / cPanel IMAP → Parser → Firestore</span>
+        <span>Only courier & subscriptions</span>
+      </footer>
+    </main>
+  </body>
+</html>

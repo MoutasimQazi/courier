@@ -1,0 +1,17 @@
+App 10128 output: node:internal/modules/esm/resolve:1001
+App 10128 output:     throw error;
+App 10128 output:     ^
+App 10128 output: Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'cors' imported from /home/savv/email-parser-backend/src/app.js
+App 10128 output:     at Object.getPackageJSONURL (node:internal/modules/package_json_reader:314:9)
+App 10128 output:     at packageResolve (node:internal/modules/esm/resolve:768:81)
+App 10128 output:     at moduleResolve (node:internal/modules/esm/resolve:855:18)
+App 10128 output:     at defaultResolve (node:internal/modules/esm/resolve:985:11)
+App 10128 output:     at #cachedDefaultResolve (node:internal/modules/esm/loader:731:20)
+App 10128 output:     at #resolveAndMaybeBlockOnLoaderThread (node:internal/modules/esm/loader:767:38)
+App 10128 output:     at ModuleLoader.resolveSync (node:internal/modules/esm/loader:790:52)
+App 10128 output:     at #cachedResolveSync (node:internal/modules/esm/loader:750:25)
+App 10128 output:     at ModuleLoader.getModuleJobForRequire (node:internal/modules/esm/loader:459:50)
+App 10128 output:     at new ModuleJobSync (node:internal/modules/esm/module_job:392:34) {
+App 10128 output:   code: 'ERR_MODULE_NOT_FOUND'
+App 10128 output: }
+App 10128 output: Node.js v22.22.2
