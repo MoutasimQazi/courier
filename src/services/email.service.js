@@ -240,10 +240,19 @@ export const transformEmail = async (rawEmail, options = {}) => {
   return buildInsight(rawEmail, parsed);
 };
 
-export const groupInsights = (insights) => ({
-  orders: insights.filter(({ data }) => data.type === "order").map(({ data }) => data),
-  subscriptions: insights.filter(({ data }) => data.type === "subscription").map(({ data }) => data),
-});
+// The key travels on the wrapper, not inside `data`, and dedupeInsights can
+// reassign it when it collapses a parcel's stream onto one record. Stamping it
+// on here — rather than at build time — is what keeps every entry's sourceId
+// identical to the one it is stored under, whether it came from the cache or
+// from an extraction moments ago.
+export const groupInsights = (insights) => {
+  const withKey = ({ sourceId, data }) => ({ ...data, sourceId });
+
+  return {
+    orders: insights.filter(({ data }) => data.type === "order").map(withKey),
+    subscriptions: insights.filter(({ data }) => data.type === "subscription").map(withKey),
+  };
+};
 
 class EmailService {
   async #getAccountInsights({ userId, accountId, limit, refresh } = {}) {
@@ -384,17 +393,47 @@ class EmailService {
 
   async getEmails({ userId, limit, refresh } = {}) {
     const accounts = await firebaseService.getConnectedAccounts(userId);
-    if (accounts.length === 0) {
-      const error = new Error("Connect a mailbox before fetching email intelligence.");
-      error.statusCode = 409;
-      error.errors = { field: "connectedAccount" };
-      throw error;
-    }
 
     // What previous syncs already extracted. Without this a run that finds no
     // new mail would answer with an empty list, which reads as a broken sync
     // rather than as "nothing has changed".
-    const stored = refresh === "full" ? [] : await firebaseService.getStoredInsights(userId);
+    const stored = await firebaseService.getStoredInsights(userId);
+
+    if (accounts.length === 0) {
+      // Insights also arrive through the forwarding mailbox, which has no
+      // connected account behind it — and that mail is deleted once extracted,
+      // so this store is the only copy. Refusing to serve it because no Unipile
+      // account is linked would make it unreachable.
+      if (stored.length === 0) {
+        const error = new Error("Connect a mailbox before fetching email intelligence.");
+        error.statusCode = 409;
+        error.errors = { field: "connectedAccount" };
+        throw error;
+      }
+
+      const insights = dedupeInsights(stored);
+      return {
+        ...groupInsights(insights),
+        cursor: null,
+        diagnostics: {
+          accounts: 0,
+          scanned: 0,
+          skipped: 0,
+          extracted: 0,
+          failed: 0,
+          backfill: false,
+          backfillTruncated: false,
+          firstError: null,
+          merged: insights.length,
+          cached: stored.length,
+          written: 0,
+        },
+      };
+    }
+
+    // A full refresh rebuilds every record from the mail itself, so it starts
+    // from nothing rather than merging onto what is already there.
+    const baseline = refresh === "full" ? [] : stored;
 
     const results = await Promise.all(accounts.map((account) => {
       return this.#getAccountInsights({
@@ -410,11 +449,11 @@ class EmailService {
     // Stored first: dedupeInsights breaks ties in favour of whatever it sees
     // last, so a re-read of the same email replaces the stored copy rather than
     // being discarded by it.
-    const insights = dedupeInsights([...stored, ...fresh]);
+    const insights = dedupeInsights([...baseline, ...fresh]);
 
     // Rewriting every record on every sync would make a no-op click cost a full
     // collection write, so only the records this run actually changed are sent.
-    const storedByKey = new Map(stored.map((insight) => [insight.sourceId, insight]));
+    const storedByKey = new Map(baseline.map((insight) => [insight.sourceId, insight]));
     const changed = insights.filter((insight) => {
       const previous = storedByKey.get(insight.sourceId);
       return !previous
@@ -451,7 +490,7 @@ class EmailService {
 
     // Counted after the cross-account merge, so it matches what is returned.
     diagnostics.merged = insights.length;
-    diagnostics.cached = stored.length;
+    diagnostics.cached = baseline.length;
     diagnostics.written = changed.length;
 
     if (diagnostics.backfillTruncated) {

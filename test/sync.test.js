@@ -21,7 +21,7 @@ import {
   oldestFailureDate,
   resolveWindow,
 } from "../src/services/syncState.js";
-import { dedupeInsights } from "../src/services/email.service.js";
+import { dedupeInsights, groupInsights } from "../src/services/email.service.js";
 
 const HISTORY_START = "2026-07-18T00:00:00.000Z";
 
@@ -189,5 +189,54 @@ describe("merging stored records with a fresh sync", () => {
       },
     ]);
     assert.equal(merged.length, 2);
+  });
+});
+
+describe("the shape handed back to the client", () => {
+  // A response mixes records read from storage with ones extracted seconds ago.
+  // Only the stored ones carry sourceId in their document, so without this the
+  // field would appear on some entries and not others, and a client keying off
+  // it would break the first time new mail arrived.
+  it("stamps sourceId on every entry, stored or fresh", () => {
+    const { orders, subscriptions } = groupInsights([
+      {
+        sourceId: "order:shop:ord-1",
+        data: { type: "order", merchant: "Shop", sourceId: "order:shop:ord-1" },
+      },
+      {
+        sourceId: "subscription:netflix",
+        data: { type: "subscription", merchant: "Netflix" },
+      },
+    ]);
+
+    assert.equal(orders[0].sourceId, "order:shop:ord-1");
+    assert.equal(subscriptions[0].sourceId, "subscription:netflix");
+  });
+
+  // dedupeInsights rewrites the wrapper's key when it collapses a parcel's
+  // stream onto one record. The entry must report the key it is stored under,
+  // not the one it was built with.
+  it("reports the canonical key after a merge, not the original", () => {
+    const merged = dedupeInsights([
+      {
+        sourceId: "order:shop:ord-1",
+        data: {
+          type: "order", merchant: "Shop", orderId: "ORD-1",
+          trackingId: "BD1", receivedAt: "2026-08-13T07:00:00Z",
+        },
+      },
+      {
+        sourceId: "e-later-email",
+        data: {
+          type: "order", merchant: "Shop", orderId: null,
+          trackingId: "BD1", receivedAt: "2026-08-15T07:00:00Z", status: "Delivered",
+        },
+      },
+    ]);
+
+    const { orders } = groupInsights(merged);
+    assert.equal(orders.length, 1);
+    assert.equal(orders[0].status, "Delivered");
+    assert.equal(orders[0].sourceId, "order:shop:ord-1");
   });
 });

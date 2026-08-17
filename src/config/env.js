@@ -52,6 +52,12 @@ const env = {
     timeout: parsePositiveInteger(process.env.CPANEL_REQUEST_TIMEOUT, 15000),
     mailboxQuotaMb: parsePositiveInteger(process.env.CPANEL_MAILBOX_QUOTA_MB, 100),
     mailboxPrefix: process.env.CPANEL_MAILBOX_PREFIX?.trim().toLowerCase() || "fwd",
+    // Forwarded mail is extracted to JSON and then erased from the mailbox, so
+    // the quota never fills and no message body is retained. This is a true
+    // expunge with no Trash copy: once a sync completes, the stored insight is
+    // the only surviving record of the email. Set false to keep the messages
+    // and mark them read instead.
+    deleteAfterSync: parseBoolean(process.env.CPANEL_DELETE_AFTER_SYNC, true),
     imap: {
       host: process.env.CPANEL_IMAP_HOST?.trim() || "",
       port: parsePositiveInteger(process.env.CPANEL_IMAP_PORT, 993),

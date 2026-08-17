@@ -184,12 +184,42 @@ class ForwardingService {
     return { mailbox: publicMailbox(mailbox) };
   }
 
+  /**
+   * Removes messages whose contents have already been stored.
+   *
+   * This is a real expunge — there is no Trash copy and no way back — so it is
+   * only ever reached after the insight write has been confirmed. If the server
+   * refuses the delete, the messages are marked read instead: the mailbox keeps
+   * growing, which is visible and fixable, whereas re-extracting them on every
+   * later sync would quietly cost a model call each time.
+   */
+  async #consumeMessages(client, uids) {
+    if (!env.cpanel.deleteAfterSync) {
+      await client.messageFlagsAdd(uids, ["\\Seen"], { uid: true });
+      return 0;
+    }
+
+    try {
+      // Returns false rather than throwing when the range resolves to nothing,
+      // so a falsy result is just as much a failure to delete as an exception.
+      if (await client.messageDelete(uids, { uid: true })) return uids.length;
+      logger.warn(`The mail server did not delete ${uids.length} processed message(s).`);
+    } catch (error) {
+      logger.error(`Could not delete ${uids.length} processed message(s).`, error);
+    }
+
+    await client.messageFlagsAdd(uids, ["\\Seen"], { uid: true }).catch(() => {});
+    return 0;
+  }
+
   async sync(userId) {
     const mailbox = await requireConnectedMailbox(userId);
     const client = createImapClient(mailbox);
     const insights = [];
     const processedUids = [];
+    const preservedUids = [];
     let scanned = 0;
+    let deleted = 0;
 
     try {
       await client.connect();
@@ -207,8 +237,17 @@ class ForwardingService {
             scanned += 1;
             const parsed = await simpleParser(message.source);
 
-            // Leave a message unread when extraction fails so the next sync
-            // retries it, instead of marking it \Seen and losing it. One bad
+            // The Gmail confirmation mail is neither an order nor a
+            // subscription, so it would otherwise be treated as junk and
+            // removed — but getVerification() has to be able to find it later,
+            // and it only arrives once. Never let it into the deletion set.
+            if (extractGmailVerification(parsed)) {
+              preservedUids.push(message.uid);
+              continue;
+            }
+
+            // Leave a message untouched when extraction fails so the next sync
+            // retries it, instead of consuming it and losing it. One bad
             // message must not stop the rest of the batch either.
             let insight;
             try {
@@ -225,9 +264,20 @@ class ForwardingService {
 
         // Same collapse the Unipile sync does: a run of messages about one
         // parcel or one subscription must store as a single record.
+        //
+        // Awaited before a single message is removed. Once deletion runs, this
+        // record is the only copy that exists, so a failed write has to leave
+        // the mailbox untouched and let the next sync try again.
         await firebaseService.storeInsightsAndWait(userId, dedupeInsights(insights));
-        for (const uid of processedUids) {
-          await client.messageFlagsAdd(uid, ["\\Seen"], { uid: true });
+
+        if (processedUids.length > 0) {
+          deleted = await this.#consumeMessages(client, processedUids);
+        }
+
+        // Marked read, never deleted: this keeps the preserved verification
+        // mail out of every later `seen: false` search without destroying it.
+        if (preservedUids.length > 0) {
+          await client.messageFlagsAdd(preservedUids, ["\\Seen"], { uid: true });
         }
       } finally {
         lock.release();
@@ -249,6 +299,8 @@ class ForwardingService {
       ...groupInsights(stored),
       scanned,
       accepted: insights.length,
+      deleted,
+      retained: preservedUids.length,
     };
   }
 
