@@ -7,7 +7,7 @@ import logger from "../utils/logger.js";
 import { decryptCredential, encryptCredential } from "../utils/credentialCipher.js";
 import cpanelService from "./cpanel.service.js";
 import firebaseService from "./firebase.service.js";
-import { dedupeInsights, transformEmail } from "./email.service.js";
+import { dedupeInsights, groupInsights, transformEmail } from "./email.service.js";
 
 const publicMailbox = (mailbox) => mailbox ? {
   email: mailbox.email,
@@ -238,9 +238,15 @@ class ForwardingService {
 
     const now = new Date().toISOString();
     await firebaseService.updateForwardingMailbox(userId, { lastSyncedAt: now, updatedAt: now });
+
+    // Messages are marked \Seen once handled, so a second sync scans nothing and
+    // used to answer with an empty list — indistinguishable from a broken run.
+    // Reading back what is stored (the write above included) keeps the response
+    // the full picture, the same way the Unipile sync does.
+    const stored = await firebaseService.getStoredInsights(userId);
+
     return {
-      orders: insights.filter(({ data }) => data.type === "order").map(({ data }) => data),
-      subscriptions: insights.filter(({ data }) => data.type === "subscription").map(({ data }) => data),
+      ...groupInsights(stored),
       scanned,
       accepted: insights.length,
     };

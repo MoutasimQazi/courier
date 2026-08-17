@@ -24,6 +24,18 @@ const env = {
     callbackSecret: process.env.UNIPILE_CALLBACK_SECRET?.trim() || "",
     webhookSecret: process.env.UNIPILE_WEBHOOK_SECRET?.trim() || "",
   },
+  sync: {
+    historyDays: parsePositiveInteger(process.env.SYNC_HISTORY_DAYS, 30),
+    // Applies only to the first sync of an account, when there is no watermark
+    // to work from and the whole history window has to be read cold.
+    backfillLimit: parsePositiveInteger(process.env.SYNC_BACKFILL_LIMIT, 200),
+    // Safety brake on incremental runs, which are normally bounded by "how much
+    // new mail arrived" rather than by a cap.
+    maxEmails: parsePositiveInteger(process.env.SYNC_MAX_EMAILS, 500),
+    overlapMinutes: parsePositiveInteger(process.env.SYNC_OVERLAP_MINUTES, 360),
+    ledgerSize: parsePositiveInteger(process.env.SYNC_LEDGER_SIZE, 500),
+    concurrency: parsePositiveInteger(process.env.SYNC_CONCURRENCY, 10),
+  },
   firebase: {
     projectId: process.env.FIREBASE_PROJECT_ID?.trim() || "",
     web: {

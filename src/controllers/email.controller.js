@@ -32,6 +32,17 @@ const getRequestOptions = (req) => {
     options.limit = limit;
   }
 
+  // Discards the watermark and the processed-email ledger for this run, so the
+  // whole history window is extracted again. Needed after a change to the
+  // prompt or the stored schema, when what is already stored no longer matches
+  // what the code would produce today.
+  if (req.query.refresh !== undefined) {
+    if (req.query.refresh !== "full") {
+      throw badRequest('refresh must be "full".', "refresh");
+    }
+    options.refresh = "full";
+  }
+
   return options;
 };
 

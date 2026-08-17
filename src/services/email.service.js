@@ -3,19 +3,21 @@ import { createHash } from "node:crypto";
 import firebaseService from "./firebase.service.js";
 import parserService from "./parser.service.js";
 import unipileService from "./unipile.service.js";
+import {
+  mergeLedger,
+  nextWatermark,
+  oldestFailureDate,
+  resolveWindow,
+} from "./syncState.js";
+import env from "../config/env.js";
 import logger from "../utils/logger.js";
 
-const EMAIL_HISTORY_DAYS = 30;
 const MAX_PAGE_SIZE = 250;
-const PARSE_CONCURRENCY = 10;
-// Hard ceiling on emails parsed per sync request, across all pages. Extraction
-// is one model call each, so this is what decides how long a sync takes.
-const MAX_EMAILS_PER_SYNC = 200;
 // Belt and braces against a cursor that never advances.
 const MAX_PAGES = 20;
 
 const getHistoryStart = () => new Date(
-  Date.now() - EMAIL_HISTORY_DAYS * 24 * 60 * 60 * 1000
+  Date.now() - env.sync.historyDays * 24 * 60 * 60 * 1000
 ).toISOString();
 
 const titleCase = (value) => {
@@ -238,26 +240,43 @@ export const transformEmail = async (rawEmail, options = {}) => {
   return buildInsight(rawEmail, parsed);
 };
 
-const groupInsights = (insights) => ({
+export const groupInsights = (insights) => ({
   orders: insights.filter(({ data }) => data.type === "order").map(({ data }) => data),
   subscriptions: insights.filter(({ data }) => data.type === "subscription").map(({ data }) => data),
 });
 
 class EmailService {
-  async #getAccountInsights({ accountId, cursor, limit } = {}) {
+  async #getAccountInsights({ userId, accountId, limit, refresh } = {}) {
+    const startedAt = Date.now();
+    const syncStartedAt = new Date().toISOString();
+
+    // A full refresh deliberately forgets both the watermark and the ledger, so
+    // the whole window is read again — needed after a prompt or schema change,
+    // when previously stored extractions are no longer what the code produces.
+    const state = refresh === "full"
+      ? { lastSyncedAt: null, recentEmailIds: [] }
+      : await firebaseService.getAccountSyncState(userId, accountId);
+
+    const { after, isBackfill } = resolveWindow({
+      lastSyncedAt: state.lastSyncedAt,
+      historyStart: getHistoryStart(),
+      overlapMinutes: env.sync.overlapMinutes,
+    });
+
+    // A first run has to read the history window cold, so it is capped to keep
+    // that one request affordable. Later runs are bounded by how much new mail
+    // actually arrived, and the ceiling is only there to contain a corrupted
+    // watermark.
+    const ceiling = isBackfill ? env.sync.backfillLimit : env.sync.maxEmails;
+
+    const alreadyProcessed = new Set(state.recentEmailIds);
     const items = [];
     const seenEmailIds = new Set();
-    const after = getHistoryStart();
     const pageSize = limit ?? MAX_PAGE_SIZE;
-    let nextCursor = cursor;
+    let nextCursor;
     let pages = 0;
+    let skipped = 0;
 
-    const startedAt = Date.now();
-
-    // `limit` is a page size, so this loop used to walk every page in the
-    // 30-day window with no ceiling. Each email costs a model call, so the
-    // total is what has to be bounded — otherwise a busy mailbox makes the
-    // request run for minutes and the client gives up before it answers.
     do {
       const result = await unipileService.getEmails({
         accountId,
@@ -269,19 +288,27 @@ class EmailService {
       pages += 1;
 
       for (const item of result.items) {
-        if (items.length >= MAX_EMAILS_PER_SYNC) break;
+        if (items.length >= ceiling) break;
 
         const id = stableSourceId(item);
-        if (!seenEmailIds.has(id)) {
-          seenEmailIds.add(id);
-          items.push(item);
+        if (seenEmailIds.has(id)) continue;
+        seenEmailIds.add(id);
+
+        // The overlap window deliberately re-offers mail a previous run already
+        // read. Recognising it here is the whole point of the ledger: it costs
+        // a set lookup instead of a model call.
+        if (alreadyProcessed.has(id)) {
+          skipped += 1;
+          continue;
         }
+
+        items.push(item);
       }
 
       nextCursor = result.cursor;
       // A cursor that never advances, or pages of nothing but already-seen
       // mail, would spin here forever without a page ceiling.
-    } while (nextCursor && items.length < MAX_EMAILS_PER_SYNC && pages < MAX_PAGES);
+    } while (nextCursor && items.length < ceiling && pages < MAX_PAGES);
 
     if (pages >= MAX_PAGES) {
       logger.warn(`Sync for account ${accountId} stopped at the ${MAX_PAGES}-page ceiling.`);
@@ -291,34 +318,60 @@ class EmailService {
     // whole page at once. Failures are collected instead of thrown: a single
     // unreachable API call should not lose an entire account's sync.
     const errors = [];
-    const parsed = await parserService.parseMany(items, { concurrency: PARSE_CONCURRENCY, errors });
+    const parsed = await parserService.parseMany(items, {
+      concurrency: env.sync.concurrency,
+      errors,
+    });
 
     for (const { emailId, error } of errors) {
       logger.error(`Extraction failed for email ${emailId ?? "(unknown)"}.`, error);
     }
 
+    const failedIndexes = new Set(errors.map(({ index }) => index));
     const extracted = items
-      .map((item, index) => buildInsight(item, parsed[index]))
+      .map((item, index) => (failedIndexes.has(index) ? null : buildInsight(item, parsed[index])))
       .filter(Boolean);
+
+    // Only emails that were actually dealt with may enter the ledger. An email
+    // whose extraction failed has not been read yet, so remembering it would
+    // mean never trying it again — the ledger records "done", not "seen".
+    const processedIds = items
+      .filter((_, index) => !failedIndexes.has(index))
+      .map((item) => stableSourceId(item));
 
     // Several emails routinely describe one order or one subscription; keep the
     // newest of each so the caller sees one entry per thing, not per email.
     const insights = dedupeInsights(extracted);
 
     logger.info(
-      `Sync for account ${accountId}: ${items.length} email(s) scanned, `
+      `Sync for account ${accountId}: ${items.length} new email(s) scanned `
+      + `(${skipped} already processed, ${isBackfill ? "backfill" : "incremental"} from ${after}), `
       + `${extracted.length} insight(s) -> ${insights.length} after merging duplicates, `
       + `${errors.length} failure(s), ${((Date.now() - startedAt) / 1000).toFixed(1)}s`
     );
 
     return {
+      accountId,
       insights,
-      cursor: null,
+      state: {
+        lastSyncedAt: nextWatermark({
+          syncStartedAt,
+          oldestFailedAt: oldestFailureDate(errors.map(({ index }) => items[index])),
+        }),
+        recentEmailIds: mergeLedger(state.recentEmailIds, processedIds, env.sync.ledgerSize),
+      },
       // Extraction failures are non-fatal by design, which means a totally
       // broken model call looks identical to "no relevant mail" — both return
       // an empty list. Report the counts so the two can be told apart.
       stats: {
         scanned: items.length,
+        skipped,
+        backfill: isBackfill,
+        // The watermark only describes mail newer than this run. A first run
+        // that filled its cap leaves older mail in the window unread, and no
+        // later sync will reach back for it — raise SYNC_BACKFILL_LIMIT and
+        // re-run with ?refresh=full to pick it up.
+        backfillTruncated: isBackfill && items.length >= ceiling,
         // Pre-merge count answers "did extraction work"; merged answers "how
         // many things did the user actually get". Both matter when diagnosing.
         extracted: extracted.length,
@@ -329,7 +382,7 @@ class EmailService {
     };
   }
 
-  async getEmails({ userId, cursor, limit } = {}) {
+  async getEmails({ userId, limit, refresh } = {}) {
     const accounts = await firebaseService.getConnectedAccounts(userId);
     if (accounts.length === 0) {
       const error = new Error("Connect a mailbox before fetching email intelligence.");
@@ -338,36 +391,87 @@ class EmailService {
       throw error;
     }
 
+    // What previous syncs already extracted. Without this a run that finds no
+    // new mail would answer with an empty list, which reads as a broken sync
+    // rather than as "nothing has changed".
+    const stored = refresh === "full" ? [] : await firebaseService.getStoredInsights(userId);
+
     const results = await Promise.all(accounts.map((account) => {
       return this.#getAccountInsights({
+        userId,
         accountId: account.accountId,
-        cursor,
         limit,
+        refresh,
       });
     }));
     // Merge again across accounts: the same order can arrive in two mailboxes.
-    const insights = dedupeInsights(results.flatMap((result) => result.insights));
+    const fresh = dedupeInsights(results.flatMap((result) => result.insights));
 
-    firebaseService.storeInsights(userId, insights);
+    // Stored first: dedupeInsights breaks ties in favour of whatever it sees
+    // last, so a re-read of the same email replaces the stored copy rather than
+    // being discarded by it.
+    const insights = dedupeInsights([...stored, ...fresh]);
+
+    // Rewriting every record on every sync would make a no-op click cost a full
+    // collection write, so only the records this run actually changed are sent.
+    const storedByKey = new Map(stored.map((insight) => [insight.sourceId, insight]));
+    const changed = insights.filter((insight) => {
+      const previous = storedByKey.get(insight.sourceId);
+      return !previous
+        || String(insight.data.receivedAt ?? "") !== String(previous.data.receivedAt ?? "");
+    });
+
+    // Awaited, and before the watermarks move. If this throws, the watermarks
+    // stay where they are and the next sync reads the same mail again — the
+    // alternative is advancing past emails whose insights were never stored.
+    await firebaseService.storeInsightsAndWait(userId, changed);
+    await Promise.all(results.map((result) => {
+      return firebaseService.updateAccountSyncState(userId, result.accountId, result.state);
+    }));
 
     const diagnostics = results.reduce((total, { stats }) => ({
       accounts: total.accounts + 1,
       scanned: total.scanned + stats.scanned,
+      skipped: total.skipped + stats.skipped,
       extracted: total.extracted + stats.extracted,
       failed: total.failed + stats.failed,
+      backfill: total.backfill || stats.backfill,
+      backfillTruncated: total.backfillTruncated || stats.backfillTruncated,
       firstError: total.firstError ?? stats.firstError,
-    }), { accounts: 0, scanned: 0, extracted: 0, failed: 0, firstError: null });
+    }), {
+      accounts: 0,
+      scanned: 0,
+      skipped: 0,
+      extracted: 0,
+      failed: 0,
+      backfill: false,
+      backfillTruncated: false,
+      firstError: null,
+    });
 
     // Counted after the cross-account merge, so it matches what is returned.
     diagnostics.merged = insights.length;
+    diagnostics.cached = stored.length;
+    diagnostics.written = changed.length;
+
+    if (diagnostics.backfillTruncated) {
+      logger.warn(
+        `Backfill filled its ${env.sync.backfillLimit}-email cap, so older mail in the `
+        + `${env.sync.historyDays}-day window was not read. Raise SYNC_BACKFILL_LIMIT and `
+        + `re-run with ?refresh=full to reach it.`
+      );
+    }
 
     if (diagnostics.failed > 0) {
       logger.warn(
         `Sync finished with ${diagnostics.failed}/${diagnostics.scanned} extraction failure(s). `
         + `First error: ${diagnostics.firstError}`
       );
-    } else if (diagnostics.scanned === 0) {
-      logger.warn("Sync found no emails at all — check the account connection and the 30-day window.");
+    } else if (diagnostics.scanned === 0 && diagnostics.skipped === 0 && stored.length === 0) {
+      logger.warn(
+        `Sync found no emails at all — check the account connection and the `
+        + `${env.sync.historyDays}-day window.`
+      );
     }
 
     return {
@@ -440,15 +544,47 @@ class EmailService {
 
     const rawEmail = await unipileService.getEmailById(emailId, accountId);
     const insight = await transformEmail(rawEmail);
+
+    if (insight) {
+      await firebaseService.storeInsightsAndWait(userId, [insight]);
+    }
+
+    // Recorded whether or not it produced an insight: the next manual sync must
+    // not spend another model call re-reading mail this webhook already paid
+    // for, and "it was not an order" is just as much a settled answer.
+    await this.#rememberProcessedEmail(userId, accountId, rawEmail);
+
     if (!insight) {
       return { processed: false, reason: "not_order_or_subscription" };
     }
 
-    await firebaseService.storeInsights(userId, [insight]);
     return {
       processed: true,
       type: insight.data.type,
     };
+  }
+
+  /**
+   * Adds one email to an account's ledger without moving its watermark — the
+   * webhook proves this single mail was handled, not that everything up to now
+   * has been.
+   */
+  async #rememberProcessedEmail(userId, accountId, rawEmail) {
+    try {
+      const state = await firebaseService.getAccountSyncState(userId, accountId);
+      await firebaseService.updateAccountSyncState(userId, accountId, {
+        lastSyncedAt: state.lastSyncedAt,
+        recentEmailIds: mergeLedger(
+          state.recentEmailIds,
+          [stableSourceId(rawEmail)],
+          env.sync.ledgerSize
+        ),
+      });
+    } catch (error) {
+      // Losing the ledger entry only costs one duplicated extraction later; it
+      // must never turn a successfully handled webhook into a failure.
+      logger.warn(`Could not record processed email for account ${accountId}: ${error.message}`);
+    }
   }
 }
 

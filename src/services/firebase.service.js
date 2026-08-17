@@ -5,37 +5,65 @@ import { fileURLToPath } from "node:url";
 
 import { getFirestoreDb } from "../config/firebase.js";
 import logger from "../utils/logger.js";
+import { keyFromData } from "./syncState.js";
 
 const pendingWrites = new Set();
-const developmentStorePath = path.join(
+const tmpDirectory = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
   "..",
-  "tmp",
-  "forwarding-development.json"
+  "tmp"
 );
+const developmentStorePath = path.join(tmpDirectory, "forwarding-development.json");
+// Local test identities never reach Firestore, so their extracted insights used
+// to be discarded outright — which meant every local sync re-ran the model over
+// mail it had already read. They get the same file-backed treatment the
+// forwarding mailboxes get, so the incremental path works offline too.
+const developmentInsightsPath = path.join(tmpDirectory, "insights-development.json");
 let developmentMailboxes = null;
+let developmentInsights = null;
 
 const isDevelopmentUser = (userId) => /^dev-[a-f\d-]{36}$/i.test(userId || "");
 
-const loadDevelopmentMailboxes = async () => {
-  if (developmentMailboxes) return developmentMailboxes;
+const loadJsonStore = async (storePath) => {
   try {
-    developmentMailboxes = JSON.parse(await readFile(developmentStorePath, "utf8"));
+    return JSON.parse(await readFile(storePath, "utf8"));
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
-    developmentMailboxes = {};
+    return {};
   }
-  return developmentMailboxes;
 };
 
-const saveDevelopmentMailboxes = async () => {
-  await mkdir(path.dirname(developmentStorePath), { recursive: true });
-  await writeFile(developmentStorePath, JSON.stringify(developmentMailboxes, null, 2), {
+const saveJsonStore = async (storePath, contents) => {
+  await mkdir(path.dirname(storePath), { recursive: true });
+  await writeFile(storePath, JSON.stringify(contents, null, 2), {
     encoding: "utf8",
     mode: 0o600,
   });
 };
+
+const loadDevelopmentMailboxes = async () => {
+  if (developmentMailboxes) return developmentMailboxes;
+  developmentMailboxes = await loadJsonStore(developmentStorePath);
+  return developmentMailboxes;
+};
+
+const saveDevelopmentMailboxes = () => saveJsonStore(developmentStorePath, developmentMailboxes);
+
+const loadDevelopmentInsights = async () => {
+  if (developmentInsights) return developmentInsights;
+  developmentInsights = await loadJsonStore(developmentInsightsPath);
+  return developmentInsights;
+};
+
+const saveDevelopmentInsights = () => saveJsonStore(developmentInsightsPath, developmentInsights);
+
+// Every stored document is written with the key it was grouped under, so it can
+// be merged with a freshly extracted one describing the same order. Documents
+// written before that field existed are recovered from their contents instead,
+// and anything that still cannot be identified keeps the id it was stored under
+// rather than being dropped.
+const storedSourceId = (documentId, data) => data?.sourceId || keyFromData(data) || documentId;
 
 const sanitizeDocumentId = (value) => {
   const source = String(value || "");
@@ -142,8 +170,82 @@ class FirebaseService {
 
   async storeInsightsAndWait(userId, insights) {
     if (insights.length === 0) return;
-    if (isDevelopmentUser(userId)) return;
+    if (isDevelopmentUser(userId)) {
+      const store = await loadDevelopmentInsights();
+      const owned = store[userId] ?? (store[userId] = {});
+      for (const insight of insights) {
+        owned[insight.sourceId] = { ...insight.data, sourceId: insight.sourceId };
+      }
+      await saveDevelopmentInsights();
+      return;
+    }
     await this.#writeInsights(userId, insights);
+  }
+
+  /**
+   * Everything already extracted for this user, keyed the same way a fresh
+   * extraction would be. A sync merges these with what it newly found so the
+   * response stays the full picture even when nothing new arrived.
+   */
+  async getStoredInsights(userId) {
+    if (isDevelopmentUser(userId)) {
+      const store = await loadDevelopmentInsights();
+      return Object.entries(store[userId] ?? {}).map(([sourceId, data]) => ({
+        sourceId: storedSourceId(sourceId, data),
+        data,
+      }));
+    }
+
+    const db = getFirestoreDb();
+    const user = db.collection("users").doc(userId);
+    const [orders, subscriptions] = await Promise.all([
+      user.collection("orders").get(),
+      user.collection("subscriptions").get(),
+    ]);
+
+    return [...orders.docs, ...subscriptions.docs].map((document) => {
+      const data = document.data();
+      return { sourceId: storedSourceId(document.id, data), data };
+    });
+  }
+
+  /**
+   * Kept on the connected-account document rather than in a collection of its
+   * own: a sync already reads that document, so the watermark costs no extra
+   * read, and every writer of it uses merge so the two cannot collide.
+   */
+  async getAccountSyncState(userId, accountId) {
+    if (isDevelopmentUser(userId)) return { lastSyncedAt: null, recentEmailIds: [] };
+
+    const db = getFirestoreDb();
+    const snapshot = await db
+      .collection("users")
+      .doc(userId)
+      .collection("connectedAccounts")
+      .doc(sanitizeDocumentId(accountId))
+      .get();
+
+    const data = snapshot.exists ? snapshot.data() : {};
+    return {
+      lastSyncedAt: data.lastSyncedAt ?? null,
+      recentEmailIds: Array.isArray(data.recentEmailIds) ? data.recentEmailIds : [],
+    };
+  }
+
+  async updateAccountSyncState(userId, accountId, state) {
+    if (isDevelopmentUser(userId)) return;
+
+    const db = getFirestoreDb();
+    await db
+      .collection("users")
+      .doc(userId)
+      .collection("connectedAccounts")
+      .doc(sanitizeDocumentId(accountId))
+      .set({
+        lastSyncedAt: state.lastSyncedAt ?? null,
+        recentEmailIds: state.recentEmailIds ?? [],
+        updatedAt: new Date().toISOString(),
+      }, { merge: true });
   }
 
   async getForwardingMailbox(userId) {
@@ -209,7 +311,9 @@ class FirebaseService {
       const documentId = sanitizeDocumentId(insight.sourceId);
       const collection = insight.data.type === "order" ? "orders" : "subscriptions";
       const reference = db.collection("users").doc(userId).collection(collection).doc(documentId);
-      writes.push(reference.set(insight.data));
+      // The document id is a one-way hash of the key, so the key itself has to
+      // be a field for a later sync to be able to merge onto this record.
+      writes.push(reference.set({ ...insight.data, sourceId: insight.sourceId }));
     }
 
     await Promise.all(writes);
