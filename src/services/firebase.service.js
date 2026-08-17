@@ -257,6 +257,24 @@ class FirebaseService {
     return snapshot.exists ? snapshot.data() : null;
   }
 
+  /**
+   * Every user with a connected forwarding mailbox, for the scheduled sweep.
+   *
+   * Queried without a `where` clause and filtered here instead: a filtered
+   * collection-group query needs an index enabled for that field across the
+   * group, and a missing one fails at runtime rather than at deploy. The
+   * document count is one per user, so reading them all costs little.
+   */
+  async listForwardingUserIds() {
+    const db = getFirestoreDb();
+    const snapshot = await db.collectionGroup("forwarding").get();
+
+    return snapshot.docs
+      .filter((document) => document.data()?.status === "connected")
+      .map((document) => document.ref.parent.parent?.id)
+      .filter(Boolean);
+  }
+
   async reserveForwardingMailbox(userId, mailbox) {
     if (isDevelopmentUser(userId)) {
       const mailboxes = await loadDevelopmentMailboxes();

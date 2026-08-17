@@ -13,7 +13,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { extractEmail, extractEmails } from "../src/extractors/emailExtractor.js";
-import { dedupeInsights, transformEmail } from "../src/services/email.service.js";
+import { dedupeInsights, transformEmail, transformEmails } from "../src/services/email.service.js";
 
 process.env.DEEPSEEK_API_KEY = "test-key";
 
@@ -442,6 +442,127 @@ describe("stored insight shape", () => {
       fetchImpl: reply({ category: "courier", confidence: 10, merchant: "Shop" }),
     });
     assert.equal(insight, null);
+  });
+});
+
+describe("batch insight building", () => {
+  // The forwarding sync maps results back onto its own IMAP messages by
+  // position, and uses that mapping to decide which ones are safe to delete.
+  // If the array ever came back misaligned, it would delete the wrong mail.
+  it("returns one entry per input, in order", async () => {
+    const results = await transformEmails([mail({ id: "a" }), mail({ id: "b" })], {
+      fetchImpl: reply(COURIER),
+    });
+    assert.equal(results.length, 2);
+    assert.equal(results[0].data.type, "order");
+    assert.equal(results[1].data.type, "order");
+  });
+
+  it("marks a failed email null and records its index", async () => {
+    const errors = [];
+    let call = 0;
+    // A 4xx is not retryable, so this fails exactly one email rather than
+    // burning through the retry budget and eventually succeeding.
+    const results = await transformEmails(
+      [mail({ id: "a" }), mail({ id: "b" }), mail({ id: "c" })],
+      {
+        concurrency: 1,
+        errors,
+        fetchImpl: async (...args) => {
+          if (++call === 2) throw Object.assign(new Error("boom"), { status: 400 });
+          return reply(COURIER)(...args);
+        },
+      }
+    );
+
+    assert.equal(results.length, 3);
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].index, 1);
+    assert.equal(results[1], null, "the failed slot is null, not a stale result");
+    assert.equal(results.filter(Boolean).length, 2, "the other two are unaffected");
+  });
+
+  it("returns null for mail that is neither an order nor a subscription", async () => {
+    const results = await transformEmails([mail()], {
+      fetchImpl: reply({ category: "none", confidence: 0 }),
+    });
+    assert.deepEqual(results, [null]);
+  });
+
+  it("handles an empty batch", async () => {
+    assert.deepEqual(await transformEmails([]), []);
+  });
+});
+
+describe("return windows", () => {
+  const order = async (extra) => (await transformEmail(mail(), {
+    fetchImpl: reply({ ...COURIER, ...extra }),
+  })).data;
+
+  it("keeps a stated deadline exactly as the mail gave it", async () => {
+    const data = await order({ returnBy: "2026-09-05", returnWindowDays: null });
+    assert.equal(data.returnBy, "2026-09-05");
+    assert.equal(data.returnByIsEstimated, false);
+  });
+
+  // The whole point of the field: "7 day returns" is not a date, and a date is
+  // what someone needs in order to act on it.
+  it("counts a stated window forward from the delivery date", async () => {
+    const data = await order({ returnBy: null, returnWindowDays: 7 });
+    assert.equal(data.deliveryDate, "2026-08-18");
+    assert.equal(data.returnBy, "2026-08-25");
+    assert.equal(data.returnWindowDays, 7);
+    assert.equal(data.returnByIsEstimated, true, "derived from an estimated delivery");
+  });
+
+  it("prefers a stated deadline over one it could work out", async () => {
+    const data = await order({ returnBy: "2026-09-05", returnWindowDays: 7 });
+    assert.equal(data.returnBy, "2026-09-05");
+    assert.equal(data.returnByIsEstimated, false);
+  });
+
+  it("still reports the window when there is no delivery date to count from", async () => {
+    const data = await order({
+      returnBy: null, returnWindowDays: 30, estimatedDelivery: null,
+    });
+    assert.equal(data.returnBy, null);
+    assert.equal(data.returnWindowDays, 30);
+  });
+
+  it("reports nothing when the mail mentions no return period", async () => {
+    const data = await order({});
+    assert.equal(data.returnBy, null);
+    assert.equal(data.returnWindowDays, null);
+    assert.equal(data.returnByIsEstimated, false);
+  });
+
+  // Clamping would have turned each of these into a plausible-looking policy the
+  // email never offered, so they are rejected outright instead.
+  for (const [name, value] of [
+    ["a window longer than any real policy", 9999],
+    ["a negative window", -7],
+    ["zero days", 0],
+    ["a non-numeric window", "seven"],
+  ]) {
+    it(`ignores ${name}`, async () => {
+      const data = await order({ returnBy: null, returnWindowDays: value });
+      assert.equal(data.returnWindowDays, null);
+      assert.equal(data.returnBy, null);
+    });
+  }
+
+  it("accepts a window the model wrote as a numeric string", async () => {
+    const data = await order({ returnBy: null, returnWindowDays: "14" });
+    assert.equal(data.returnWindowDays, 14);
+    assert.equal(data.returnBy, "2026-09-01");
+  });
+
+  it("leaves a subscription with no return fields at all", async () => {
+    const insight = await transformEmail(mail(), {
+      fetchImpl: reply({ ...SUBSCRIPTION, returnBy: "2026-09-05", returnWindowDays: 7 }),
+    });
+    assert.equal(insight.data.returnBy, undefined);
+    assert.equal(insight.data.returnWindowDays, undefined);
   });
 });
 

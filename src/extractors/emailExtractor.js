@@ -38,6 +38,9 @@ const MAX_IMAGES = 8;
 const MAX_ITEMS = 10;
 const MAX_SUBJECT_CHARS = 500;
 const MAX_FIELD_CHARS = 300;
+// No retailer offers a return window longer than this; anything beyond it is a
+// misread number rather than a policy.
+const MAX_RETURN_WINDOW_DAYS = 365;
 
 // Marketing mail is mostly chrome: tracking pixels, logos, social badges and
 // spacer gifs. None of them is the product, and each one costs prompt space,
@@ -120,6 +123,8 @@ Return ONLY one valid JSON object. Do not return markdown fences, explanations, 
   "carrier": string|null,
   "status": "delivered"|"out_for_delivery"|"in_transit"|"shipped"|"delayed"|"confirmed"|null,
   "estimatedDelivery": "YYYY-MM-DD"|null,
+  "returnBy": "YYYY-MM-DD"|null,
+  "returnWindowDays": number|null,
   "renewalDate": "YYYY-MM-DD"|null,
   "trialEndsAt": "YYYY-MM-DD"|null,
   "billingCycle": "weekly"|"monthly"|"quarterly"|"yearly"|null,
@@ -161,6 +166,14 @@ Rules for general values:
 - serviceUrl is the home page of the company or service, such as "https://netflix.com". Prefer a link given with the email; if none is present you may use the obvious public address implied by the sender's domain. This is the field to fill for a subscription, and it may also be filled for a courier email when the merchant's site is clear.
 - merchant must be the actual company or brand, not a generic sender name such as "no-reply".
 - Fields unrelated to the selected category should be null unless the email genuinely states both kinds of information.
+
+Rules for returns:
+- returnBy is the last calendar date the recipient may return or exchange the item, used only when the email states an actual date, such as "returns accepted until 27 August".
+- returnWindowDays is the length of the return period in days, used only when the email states a duration, such as "7 day returns", "return within 30 days", "free returns for two weeks". Give the number of days as a number: "two weeks" is 14.
+- An email may state one, both, or neither. State a duration but no date, and returnBy is null. State a date but no duration, and returnWindowDays is null.
+- A link to a returns or refunds policy page with no period or date written in the email is NOT enough. Leave both null.
+- A warranty or guarantee period is not a return window. Leave both null.
+- Both fields are for courier email only. For a subscription email, leave both null.
 
 Rules for filter:
 - If category is "courier", set subscriptionStatus and subscriptionCategory to null.
@@ -290,6 +303,13 @@ async function extractEmail(raw = {}, opts = {}) {
         status: pick(ai.status, STATUSES),
         estimatedDelivery: isoDate(ai.estimatedDelivery, year),
       },
+      // A mail states the return period either as a deadline or as a duration,
+      // rarely both. Keep whichever it gave; working one out from the other
+      // needs a delivery date and belongs to the caller, not here.
+      returns: {
+        returnBy: isoDate(ai.returnBy, year),
+        windowDays: intOrNull(ai.returnWindowDays, 1, MAX_RETURN_WINDOW_DAYS),
+      },
       subscription: null,
       // The prompt asks for the off-category facets to be null; enforce it here
       // rather than trusting it, so a stray value can't reach the database.
@@ -305,6 +325,7 @@ async function extractEmail(raw = {}, opts = {}) {
   return {
     ...base,
     shipping: null,
+    returns: null,
     subscription: {
       isSubscription: true,
       renewalDate: isoDate(ai.renewalDate, year),
@@ -527,6 +548,16 @@ function clampInt(v, lo, hi) {
   const n = Math.round(Number(v));
   if (!isFinite(n)) return 0;
   return Math.min(hi, Math.max(lo, n));
+}
+
+// Unlike clampInt, a value outside the range is rejected rather than pulled to
+// the nearest edge. A return window is a fact read off the mail, so a nonsense
+// figure has to become "not stated" — clamping 9999 down to 365 would invent a
+// year-long return policy that the email never offered.
+function intOrNull(v, lo, hi) {
+  if (v == null || v === "") return null;
+  const n = Math.round(Number(v));
+  return isFinite(n) && n >= lo && n <= hi ? n : null;
 }
 
 function pick(v, allowed) {

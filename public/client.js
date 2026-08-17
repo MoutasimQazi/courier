@@ -328,9 +328,13 @@ forwardingSyncButton.addEventListener("click", async () => {
   forwardingMessage.textContent = "Reading unseen forwarded emails through IMAP...";
   forwardingSyncButton.disabled = true;
   try {
-    const payload = await apiRequest("/api/forwarding/sync", { method: "POST" });
+    // Same reason the mailbox sync needs it: one model call per message means a
+    // real batch runs far longer than the 15s default, and aborting here does
+    // not stop the server — it finishes and deletes the mail regardless.
+    const payload = await apiRequest("/api/forwarding/sync", { method: "POST", timeout: 180000 });
     showIntelligence(payload);
-    forwardingMessage.textContent = `Scanned ${payload.metadata?.scanned ?? 0}; accepted ${payload.metadata?.accepted ?? 0}.`;
+    forwardingMessage.textContent = `Scanned ${payload.metadata?.scanned ?? 0}; `
+      + `accepted ${payload.metadata?.accepted ?? 0}; removed ${payload.metadata?.deleted ?? 0}.`;
   } catch (error) {
     forwardingMessage.textContent = error.message;
   } finally {

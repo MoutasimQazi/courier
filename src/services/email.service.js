@@ -156,36 +156,74 @@ export const dedupeInsights = (insights) => {
   return [...latest.values()];
 };
 
-const toOrder = (parsed) => ({
-  type: "order",
-  merchant: parsed.merchant ?? null,
-  merchantDomain: parsed.merchantDomain ?? null,
-  // productUrl is where the item lives; imageUrl is its picture. serviceUrl and
-  // logoUrl identify the company behind it.
-  productUrl: parsed.productUrl ?? null,
-  serviceUrl: parsed.serviceUrl ?? null,
-  logoUrl: parsed.logoUrl ?? null,
-  // Drives the newest-wins collapse when several emails describe one order.
-  receivedAt: parsed.receivedAt ?? null,
-  emailId: parsed.emailId ?? null,
-  // orderId is the reference the merchant assigned; orderName is what a person
-  // would call the purchase. Keep them apart — one is for lookup, one is for
-  // display, and they are never interchangeable.
-  orderId: parsed.order?.orderNumber ?? null,
-  orderName: parsed.order?.orderName ?? null,
-  orderDate: parsed.order?.orderDate ?? null,
-  trackingId: parsed.shipping?.trackingNumber ?? null,
-  trackingUrl: parsed.shipping?.trackingUrl ?? null,
-  carrier: parsed.shipping?.carrier ?? null,
-  amount: parsed.order?.amount ?? null,
-  currency: parsed.order?.currency ?? null,
-  status: titleCase(parsed.shipping?.status),
-  deliveryDate: parsed.shipping?.estimatedDelivery ?? null,
-  imageUrl: parsed.imageUrl ?? null,
-  // Filter facet, stored raw (not title-cased) so the client can match on it.
-  category: parsed.filter?.orderCategory ?? null,
-  items: parsed.order?.items ?? [],
-});
+/**
+ * The date by which the item has to go back.
+ *
+ * An email usually states one half of this: either a deadline ("returns until
+ * 27 August") or a duration ("7 day returns"). The deadline is what a person
+ * actually needs, so when only the duration is given it is counted forward from
+ * the delivery date — the point a return window starts from.
+ *
+ * That derivation is flagged, because until the parcel is actually delivered
+ * the delivery date is itself an estimate, and so is any deadline built on it.
+ */
+const returnDeadline = (parsed) => {
+  const stated = parsed.returns?.returnBy ?? null;
+  if (stated) return { returnBy: stated, estimated: false };
+
+  const windowDays = parsed.returns?.windowDays ?? null;
+  const delivery = parsed.shipping?.estimatedDelivery ?? null;
+  if (!windowDays || !delivery) return { returnBy: null, estimated: false };
+
+  // Parsed as UTC so adding days cannot shift the date across a timezone the
+  // way a local-midnight parse would.
+  const deadline = new Date(`${delivery}T00:00:00Z`);
+  if (isNaN(deadline.getTime())) return { returnBy: null, estimated: false };
+
+  deadline.setUTCDate(deadline.getUTCDate() + windowDays);
+  return { returnBy: deadline.toISOString().slice(0, 10), estimated: true };
+};
+
+const toOrder = (parsed) => {
+  const returns = returnDeadline(parsed);
+
+  return {
+    type: "order",
+    merchant: parsed.merchant ?? null,
+    merchantDomain: parsed.merchantDomain ?? null,
+    // productUrl is where the item lives; imageUrl is its picture. serviceUrl and
+    // logoUrl identify the company behind it.
+    productUrl: parsed.productUrl ?? null,
+    serviceUrl: parsed.serviceUrl ?? null,
+    logoUrl: parsed.logoUrl ?? null,
+    // Drives the newest-wins collapse when several emails describe one order.
+    receivedAt: parsed.receivedAt ?? null,
+    emailId: parsed.emailId ?? null,
+    // orderId is the reference the merchant assigned; orderName is what a person
+    // would call the purchase. Keep them apart — one is for lookup, one is for
+    // display, and they are never interchangeable.
+    orderId: parsed.order?.orderNumber ?? null,
+    orderName: parsed.order?.orderName ?? null,
+    orderDate: parsed.order?.orderDate ?? null,
+    trackingId: parsed.shipping?.trackingNumber ?? null,
+    trackingUrl: parsed.shipping?.trackingUrl ?? null,
+    carrier: parsed.shipping?.carrier ?? null,
+    amount: parsed.order?.amount ?? null,
+    currency: parsed.order?.currency ?? null,
+    status: titleCase(parsed.shipping?.status),
+    deliveryDate: parsed.shipping?.estimatedDelivery ?? null,
+    // returnBy is the deadline itself; returnWindowDays is the period as the
+    // mail worded it ("7 day returns"), kept so the window can still be shown
+    // when there is no delivery date to count it from.
+    returnBy: returns.returnBy,
+    returnWindowDays: parsed.returns?.windowDays ?? null,
+    returnByIsEstimated: returns.estimated,
+    imageUrl: parsed.imageUrl ?? null,
+    // Filter facet, stored raw (not title-cased) so the client can match on it.
+    category: parsed.filter?.orderCategory ?? null,
+    items: parsed.order?.items ?? [],
+  };
+};
 
 const toSubscription = (parsed) => ({
   type: "subscription",
@@ -238,6 +276,33 @@ const buildInsight = (rawEmail, parsed) => {
 export const transformEmail = async (rawEmail, options = {}) => {
   const parsed = await parserService.parse(rawEmail, options);
   return buildInsight(rawEmail, parsed);
+};
+
+/**
+ * Batch counterpart to transformEmail.
+ *
+ * Extraction is one model call per email, so a caller with a hundred messages
+ * must not await them one at a time — that is minutes of wall clock for work
+ * that is almost entirely waiting. Returns an array aligned with the input, so
+ * the caller can still tell which of its own messages each result belongs to,
+ * with null for mail that is neither an order nor a subscription *and* for mail
+ * that failed. Failures are pushed to `errors` with their index rather than
+ * rejecting, so one unreachable API call cannot lose the whole batch.
+ */
+export const transformEmails = async (rawEmails, { concurrency, errors = [], ...options } = {}) => {
+  // Everything else — signal, model, fetchImpl — belongs to the extractor and
+  // has to reach it. Destructuring only the two fields this function uses would
+  // silently drop the caller's cancellation signal.
+  const parsed = await parserService.parseMany(rawEmails, {
+    ...options,
+    concurrency: concurrency ?? env.sync.concurrency,
+    errors,
+  });
+
+  const failed = new Set(errors.map(({ index }) => index));
+  return rawEmails.map((rawEmail, index) => (
+    failed.has(index) ? null : buildInsight(rawEmail, parsed[index])
+  ));
 };
 
 // The key travels on the wrapper, not inside `data`, and dedupeInsights can

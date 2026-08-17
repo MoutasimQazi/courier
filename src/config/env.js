@@ -7,6 +7,14 @@ const parsePositiveInteger = (value, fallback) => {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 };
 
+// Unlike parsePositiveInteger, zero is a meaningful value here rather than a
+// mistake: it is how an interval is switched off.
+const parseInterval = (value, fallback) => {
+  if (value === undefined || value === null || value === "") return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+};
+
 const parseBoolean = (value, fallback = false) => {
   if (value === undefined || value === null || value === "") return fallback;
   return String(value).trim().toLowerCase() === "true";
@@ -58,6 +66,9 @@ const env = {
     // the only surviving record of the email. Set false to keep the messages
     // and mark them read instead.
     deleteAfterSync: parseBoolean(process.env.CPANEL_DELETE_AFTER_SYNC, true),
+    // How often the server sweeps every connected forwarding mailbox on its
+    // own. Zero switches the sweep off and leaves syncing to the button.
+    sweepMinutes: parseInterval(process.env.CPANEL_SYNC_INTERVAL_MINUTES, 15),
     imap: {
       host: process.env.CPANEL_IMAP_HOST?.trim() || "",
       port: parsePositiveInteger(process.env.CPANEL_IMAP_PORT, 993),

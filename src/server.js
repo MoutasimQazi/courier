@@ -3,6 +3,10 @@ import { createServer } from "node:http";
 import app from "./app.js";
 import env from "./config/env.js";
 import firebaseService from "./services/firebase.service.js";
+import {
+  startForwardingScheduler,
+  stopForwardingScheduler,
+} from "./services/forwardingScheduler.js";
 import logger from "./utils/logger.js";
 
 const server = createServer(app);
@@ -20,6 +24,7 @@ server.once("error", (error) => {
 
 server.listen(env.port, () => {
   logger.success(`Server started successfully on http://localhost:${env.port}`);
+  startForwardingScheduler();
 });
 
 const shutdown = (signal) => {
@@ -27,6 +32,8 @@ const shutdown = (signal) => {
   isShuttingDown = true;
 
   logger.info(`${signal} received. Closing HTTP server.`);
+  // Stopped first so a sweep cannot start while the server is winding down.
+  stopForwardingScheduler();
   server.close(async (error) => {
     if (error) {
       logger.error("Failed to close HTTP server cleanly.", error);
