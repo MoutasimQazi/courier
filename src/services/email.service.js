@@ -4,6 +4,7 @@ import firebaseService from "./firebase.service.js";
 import parserService from "./parser.service.js";
 import unipileService from "./unipile.service.js";
 import {
+  merchantIdentity,
   mergeLedger,
   nextWatermark,
   oldestFailureDate,
@@ -58,9 +59,11 @@ const hasSubscriptionEvidence = (parsed) => Boolean(
   || parsed.subscription?.trialEndsAt
   || parsed.subscription?.billingCycle
   || (parsed.subscription?.amount != null && parsed.subscription?.currency)
-  // A cancellation confirmation usually states no amount, date or cycle — the
-  // status is the concrete fact in that case, so accept it on its own.
+  // A cancellation confirmation, and a "your free trial has started" notice,
+  // usually state no amount, date or cycle — the status is the concrete fact in
+  // those cases, so accept it on its own.
   || parsed.filter?.subscriptionStatus === "cancelled"
+  || parsed.filter?.subscriptionStatus === "trial"
 );
 
 // Prefer the plan name the model read off the mail; fall back to the keyword
@@ -99,7 +102,11 @@ const stableSourceId = (rawEmail) => {
  * unidentifiable mail still gets stored rather than colliding with others.
  */
 const insightKey = (parsed, rawEmail) => {
-  const merchant = (parsed.merchant ?? "").trim().toLowerCase();
+  // Identity comes from the brand domain where there is one, because the
+  // model's merchant *name* varies between runs over the very same mail
+  // ("Anthropic" / "Anthropic, PBC") and every variant would open its own
+  // record. See merchantIdentity().
+  const merchant = merchantIdentity(parsed);
 
   if (parsed.category === "courier") {
     // The order number is the real identity; tracking number is the runner-up
@@ -123,7 +130,7 @@ const insightKey = (parsed, rawEmail) => {
  * winner within a single sync would be whichever request happened to finish
  * last rather than whichever email is newest.
  */
-const trackingAlias = (data) => `${String(data.merchant ?? "").trim().toLowerCase()}`
+const trackingAlias = (data) => `${merchantIdentity(data) ?? ""}`
   + `:${String(data.trackingId ?? "").trim().toLowerCase()}`;
 
 export const dedupeInsights = (insights) => {
@@ -192,8 +199,11 @@ const toOrder = (parsed) => {
     merchant: parsed.merchant ?? null,
     merchantDomain: parsed.merchantDomain ?? null,
     // productUrl is where the item lives; imageUrl is its picture. serviceUrl and
-    // logoUrl identify the company behind it.
+    // logoUrl identify the company behind it. manageUrl is the order's own page
+    // — where it is viewed, amended, or cancelled — which is a different
+    // destination from the product and worth keeping apart from it.
     productUrl: parsed.productUrl ?? null,
+    manageUrl: parsed.order?.manageUrl ?? null,
     serviceUrl: parsed.serviceUrl ?? null,
     logoUrl: parsed.logoUrl ?? null,
     // Drives the newest-wins collapse when several emails describe one order.
@@ -214,10 +224,15 @@ const toOrder = (parsed) => {
     deliveryDate: parsed.shipping?.estimatedDelivery ?? null,
     // returnBy is the deadline itself; returnWindowDays is the period as the
     // mail worded it ("7 day returns"), kept so the window can still be shown
-    // when there is no delivery date to count it from.
+    // when there is no delivery date to count it from. Zero rather than null
+    // when no period applies, so a client can show "0 days" without having to
+    // decide what a missing number means.
     returnBy: returns.returnBy,
-    returnWindowDays: parsed.returns?.windowDays ?? null,
+    returnWindowDays: parsed.returns?.windowDays ?? 0,
     returnByIsEstimated: returns.estimated,
+    // What may be done with the item at all: sent back for a refund, exchanged
+    // only, or neither. Null when the email never said.
+    returnType: parsed.returns?.type ?? null,
     imageUrl: parsed.imageUrl ?? null,
     // Filter facet, stored raw (not title-cased) so the client can match on it.
     category: parsed.filter?.orderCategory ?? null,
@@ -231,8 +246,11 @@ const toSubscription = (parsed) => ({
   merchantDomain: parsed.merchantDomain ?? null,
   orderName: parsed.order?.orderName ?? null,
   imageUrl: parsed.imageUrl ?? null,
-  // The service's own page, and a logo derived from its domain.
+  // The service's own page, and a logo derived from its domain. manageUrl is
+  // the billing page behind it — where the plan is changed or cancelled, which
+  // is the one link a person actually needs from a renewal notice.
   serviceUrl: parsed.serviceUrl ?? null,
+  manageUrl: parsed.subscription?.manageUrl ?? null,
   logoUrl: parsed.logoUrl ?? null,
   receivedAt: parsed.receivedAt ?? null,
   emailId: parsed.emailId ?? null,
@@ -242,6 +260,10 @@ const toSubscription = (parsed) => ({
   billingCycle: parsed.subscription?.billingCycle ?? null,
   renewalDate: parsed.subscription?.renewalDate ?? null,
   trialEndsAt: parsed.subscription?.trialEndsAt ?? null,
+  // How the charge is paid, and the only part of the card that is ever kept —
+  // the last four digits, which is what a person recognises the card by.
+  paymentType: parsed.subscription?.paymentType ?? null,
+  cardLast4: parsed.subscription?.cardLast4 ?? null,
   // Filter facets, stored raw so the client can match on them.
   category: parsed.filter?.subscriptionCategory ?? null,
   subscriptionStatus: parsed.filter?.subscriptionStatus ?? null,
@@ -477,6 +499,10 @@ class EmailService {
       }
 
       const insights = dedupeInsights(stored);
+      // Collapsed here means collapsed in storage too, otherwise every read
+      // would have to keep re-merging the same leftovers.
+      await firebaseService.pruneRelocatedInsights(userId, stored, insights);
+
       return {
         ...groupInsights(insights),
         cursor: null,
@@ -529,6 +555,12 @@ class EmailService {
     // stay where they are and the next sync reads the same mail again — the
     // alternative is advancing past emails whose insights were never stored.
     await firebaseService.storeInsightsAndWait(userId, changed);
+
+    // Records whose key was recomputed on read have just been written at their
+    // canonical id; the documents they used to live at are now leftovers, and
+    // stay a duplicate in storage until they are removed.
+    await firebaseService.pruneRelocatedInsights(userId, stored, insights);
+
     await Promise.all(results.map((result) => {
       return firebaseService.updateAccountSyncState(userId, result.accountId, result.state);
     }));

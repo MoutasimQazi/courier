@@ -15,6 +15,46 @@ const isoOrNull = (value) => {
 };
 
 /**
+ * Legal suffixes a company writes after its name — and which the extraction
+ * model includes or drops depending on how a given email happened to word it.
+ * "Anthropic" and "Anthropic, PBC" are one service, so the suffix is cut off
+ * before a name is ever used as identity.
+ */
+const LEGAL_SUFFIX = /[\s,]+(?:inc|llc|l\.l\.c|ltd|limited|pbc|plc|gmbh|ug|bv|b\.v|nv|n\.v|sa|s\.a|sas|srl|spa|ag|oy|ab|as|aps|pte|pty|co|corp|corporation|company|holdings|group|technologies|labs)\.?$/i;
+
+const normaliseMerchantName = (value) => {
+  let name = String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+
+  // "Foo Technologies, Inc." carries two of them, so strip until none is left.
+  // Bounded, because a name that is *only* suffixes must not reduce to "".
+  for (let pass = 0; pass < 3; pass += 1) {
+    const trimmed = name.replace(LEGAL_SUFFIX, "").trim();
+    if (!trimmed || trimmed === name) break;
+    name = trimmed;
+  }
+
+  return name.replace(/[.,]+$/, "").trim();
+};
+
+/**
+ * Which *service* a record belongs to.
+ *
+ * The merchant name is free text the model reads off the mail, and it is not
+ * stable: the same Anthropic receipt came back as "Anthropic" one sync and
+ * "Anthropic, PBC" the next, which keyed the two extractions apart and left a
+ * duplicate subscription behind. The domain behind the brand is derived from
+ * the service URL or the sender rather than written by the model, so it says
+ * the same thing every time — it is the identity, and the cleaned-up name is
+ * only the fallback for mail with no usable domain.
+ */
+export const merchantIdentity = (data) => {
+  const domain = String(data?.merchantDomain ?? "").trim().toLowerCase();
+  if (domain) return domain;
+
+  return normaliseMerchantName(data?.merchant) || null;
+};
+
+/**
  * The insight key for an already-stored document.
  *
  * Mirrors insightKey() in email.service.js, but reads the flattened shape that
@@ -28,7 +68,7 @@ const isoOrNull = (value) => {
  */
 export const keyFromData = (data) => {
   if (!data || typeof data !== "object") return null;
-  const merchant = String(data.merchant ?? "").trim().toLowerCase();
+  const merchant = merchantIdentity(data);
 
   if (data.type === "order") {
     const reference = data.orderId ?? data.trackingId;

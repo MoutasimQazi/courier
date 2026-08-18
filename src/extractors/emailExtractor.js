@@ -74,10 +74,23 @@ const STATUSES = ["delivered", "out_for_delivery", "in_transit", "shipped", "del
 const CYCLES = ["weekly", "monthly", "quarterly", "yearly"];
 const CURRENCIES = ["INR", "USD", "EUR", "GBP", "AED", "AUD", "CAD", "SGD", "JPY", "CNY"];
 
+// What the mail says the recipient may do with the item. "returnable" is the
+// ordinary money-back window; "replaceable" is an exchange-only policy, which
+// retailers word very differently ("replacement only", "no refunds") and which
+// a person needs to know before the window runs out.
+const RETURN_TYPES = ["returnable", "replaceable", "non_returnable"];
+
+// How the charge was paid. Kept coarse on purpose: the useful question is
+// "which of my methods pays for this", not the processor's own vocabulary.
+const PAYMENT_TYPES = [
+  "card", "upi", "netbanking", "wallet", "paypal",
+  "apple_pay", "google_pay", "bank_transfer", "other",
+];
+
 // Filter facets. These must stay in step with the enums listed in the prompt —
 // anything the model invents outside these lists is dropped to null.
-const ORDER_CATEGORIES = ["shopping", "electronics", "fashion", "groceries", "pharmacy", "food", "other"];
-const SUBSCRIPTION_STATUSES = ["active", "cancelled"];
+const ORDER_CATEGORIES = ["shopping", "electronics", "fashion", "groceries", "pharmacy", "food", "gift_card", "other"];
+const SUBSCRIPTION_STATUSES = ["active", "trial", "cancelled"];
 const SUBSCRIPTION_CATEGORIES = ["entertainment", "ai_tools", "designing_tools", "productivity", "music_and_video", "other"];
 
 /* ------------------------------- prompt ------------------------------- */
@@ -88,7 +101,7 @@ const SUBSCRIPTION_CATEGORIES = ["entertainment", "ai_tools", "designing_tools",
 
 const SYSTEM_PROMPT = `You extract structured data from a single email. You only care about two kinds of mail:
 
-1. COURIER — a real shipment/parcel update for an order the recipient placed (shipped, in transit, out for delivery, delivered, delayed, or an order confirmation that carries shipping info).
+1. COURIER — a real shipment/parcel update for an order the recipient placed (shipped, in transit, out for delivery, delivered, delayed, or an order confirmation that carries shipping info). A gift card, gift voucher, or e-gift certificate the recipient bought or was sent also belongs here, even when it is delivered by email and nothing physically ships.
 2. SUBSCRIPTION — recurring billing mail: a renewal, an auto-renew notice, a trial that converts to paid, a membership charge, a cancellation, or a plan upgrade/downgrade with a recurring price.
 
 EVERYTHING ELSE is irrelevant: marketing and promotions ("free shipping", "we deliver", sale announcements), newsletters, one-off receipts with no shipment and no recurring billing, order confirmations with no shipping or tracking detail at all, password resets, personal mail, and social notifications. For those, return category "none".
@@ -115,7 +128,9 @@ Return ONLY one valid JSON object. Do not return markdown fences, explanations, 
   "orderDate": "YYYY-MM-DD"|null,
   "imageUrl": string|null,
   "productUrl": string|null,
+  "orderManageUrl": string|null,
   "serviceUrl": string|null,
+  "subscriptionManageUrl": string|null,
   "amount": number|null,
   "currency": "INR"|"USD"|"EUR"|"GBP"|"AED"|"AUD"|"CAD"|"SGD"|"JPY"|"CNY"|null,
   "trackingNumber": string|null,
@@ -125,13 +140,16 @@ Return ONLY one valid JSON object. Do not return markdown fences, explanations, 
   "estimatedDelivery": "YYYY-MM-DD"|null,
   "returnBy": "YYYY-MM-DD"|null,
   "returnWindowDays": number|null,
+  "returnType": "returnable"|"replaceable"|"non_returnable"|null,
+  "paymentType": "card"|"upi"|"netbanking"|"wallet"|"paypal"|"apple_pay"|"google_pay"|"bank_transfer"|"other"|null,
+  "cardLast4": string|null,
   "renewalDate": "YYYY-MM-DD"|null,
   "trialEndsAt": "YYYY-MM-DD"|null,
   "billingCycle": "weekly"|"monthly"|"quarterly"|"yearly"|null,
   "plan": string|null,
   "filter": {
-    "orderCategory": "shopping"|"electronics"|"fashion"|"groceries"|"pharmacy"|"food"|"other"|null,
-    "subscriptionStatus": "active"|"cancelled"|null,
+    "orderCategory": "shopping"|"electronics"|"fashion"|"groceries"|"pharmacy"|"food"|"gift_card"|"other"|null,
+    "subscriptionStatus": "active"|"trial"|"cancelled"|null,
     "subscriptionCategory": "entertainment"|"ai_tools"|"designing_tools"|"productivity"|"music_and_video"|"other"|null,
     "billingCycle": "weekly"|"monthly"|"quarterly"|"yearly"|null
   }
@@ -162,9 +180,11 @@ Rules for general values:
 - For a subscription, orderName is the service and plan in plain words, such as "Netflix Premium", and items is [].
 - orderDate is the date the order was placed or the payment was made, not the delivery or renewal date.
 - imageUrl must be copied verbatim from one of the images provided with the email. Choose the picture of the product that was ordered, or for a subscription the service's own logo. If the only images are banners, promotions, or decoration, use null. Never invent an image address.
-- productUrl must be copied verbatim from one of the links provided with the email. It is the page for the product or the order itself — a product page, an "view your order" or "order details" link. It is NOT the tracking link, NOT the unsubscribe link, and NOT the merchant's home page. Use null for a subscription email.
+- productUrl must be copied verbatim from one of the links provided with the email. It is the page for the item that was bought — a product or listing page. It is NOT the order page (that is orderManageUrl), NOT the tracking link, NOT the unsubscribe link, and NOT the merchant's home page. Use null for a subscription email.
+- orderManageUrl must be copied verbatim from one of the links provided with the email. It is the page where the recipient looks after the order itself — "view your order", "order details", "manage order", "modify or cancel order", "download invoice". Prefer the most specific such link when the email offers several. It is NOT the tracking link and NOT a product page. Use null for a subscription email.
 - serviceUrl is the home page of the company or service, such as "https://netflix.com". Prefer a link given with the email; if none is present you may use the obvious public address implied by the sender's domain. This is the field to fill for a subscription, and it may also be filled for a courier email when the merchant's site is clear.
-- merchant must be the actual company or brand, not a generic sender name such as "no-reply".
+- subscriptionManageUrl must be copied verbatim from one of the links provided with the email. It is the page where the recipient looks after the paid plan — "manage subscription", "manage membership", "billing settings", "change or cancel your plan", "update payment method". An "unsubscribe", "email preferences", or "notification settings" link is about mail and is NEVER this field. Use null for a courier email.
+- merchant must be the actual company or brand, not a generic sender name such as "no-reply". Give the short brand name a customer would recognise and always write it the same way, leaving off any legal suffix the email happens to include: "Anthropic", not "Anthropic, PBC"; "Netflix", not "Netflix International B.V.".
 - Fields unrelated to the selected category should be null unless the email genuinely states both kinds of information.
 
 Rules for returns:
@@ -173,7 +193,14 @@ Rules for returns:
 - An email may state one, both, or neither. State a duration but no date, and returnBy is null. State a date but no duration, and returnWindowDays is null.
 - A link to a returns or refunds policy page with no period or date written in the email is NOT enough. Leave both null.
 - A warranty or guarantee period is not a return window. Leave both null.
-- Both fields are for courier email only. For a subscription email, leave both null.
+- returnType is what the email says may be done with the item: "returnable" when it may be sent back for a refund, "replaceable" when only an exchange or replacement is offered and a refund is not ("replacement only", "exchange within 7 days, no refunds"), "non_returnable" when the email states the item cannot be sent back at all ("final sale", "non-returnable", "no returns on this item"). Use null when the email says nothing about it — a return window on its own is enough to answer "returnable".
+- A perishable, personalised, or clearance item is only non_returnable if the email actually says so. Do not decide it from the kind of product.
+- All three fields are for courier email only. For a subscription email, leave them null.
+
+Rules for payment (subscription email only — leave both null for a courier email):
+- paymentType is how the recurring charge is paid, used only when the email actually names the method: "card" for any credit or debit card, "upi", "netbanking", "wallet" for a stored balance or in-app wallet, "paypal", "apple_pay", "google_pay", "bank_transfer" for a direct debit, mandate, or bank transfer, and "other" for a named method that fits none of these. Use null when the email does not say.
+- When the email names both a wallet and the card inside it ("Apple Pay ending 4242"), choose the wallet.
+- cardLast4 is ONLY the last four digits of the card or account the email prints, as digits: "Visa ending in 4242" gives "4242", "**** **** **** 1234" gives "1234". Never return more than four digits, never return a full card number, and never return the expiry, CVV, or the cardholder's name. Use null when the email prints no digits.
 
 Rules for filter:
 - If category is "courier", set subscriptionStatus and subscriptionCategory to null.
@@ -188,14 +215,16 @@ Order category rules:
 - groceries: supermarket goods, household groceries, packaged ingredients, and everyday provisions.
 - pharmacy: medicines, prescriptions, supplements, medical supplies, and pharmacy purchases.
 - food: restaurant orders, takeout, prepared meals, and food-delivery orders.
+- gift_card: a gift card, gift voucher, e-gift certificate, or top-up code, whether the recipient bought it, was sent one, or had one delivered by email. This wins over the category of whatever the card may later be spent on.
 - shopping: general retail or marketplace orders that do not clearly fit electronics, fashion, groceries, pharmacy, or food.
 - other: travel bookings, tickets, furniture, services, or any shipped purchase that does not reasonably fit another order category.
 - Prefer the most specific applicable category. For example, a phone purchased from a general marketplace is electronics, not shopping.
 
 Subscription status rules:
 - cancelled: The email explicitly confirms cancellation, expiration caused by cancellation, non-renewal, or termination of the recurring plan.
-- active: The email confirms a recurring charge, renewal, upcoming renewal, active paid membership, trial converting to paid, or continuing recurring service.
-- Use null when the email does not provide enough evidence to determine active or cancelled.
+- active: The email confirms a recurring charge, renewal, upcoming renewal, active paid membership, or continuing recurring service — including a trial that has just converted to paid, which is a paid plan from that moment on.
+- trial: The recipient is in a free or discounted trial that has NOT yet been charged — "your free trial has started", "your trial ends in 3 days", "you will be charged when your trial ends". Prefer trial over active whenever the email is about the trial period itself, and fill trialEndsAt when the email gives the date.
+- Use null when the email does not provide enough evidence to determine active, trial, or cancelled.
 
 Subscription category rules:
 - entertainment: streaming, gaming, news, books, sports, or general entertainment subscriptions that are not primarily music/video services.
@@ -284,6 +313,10 @@ async function extractEmail(raw = {}, opts = {}) {
       orderDate: isoDate(ai.orderDate, year),
       amount: num(ai.amount),
       currency: pick(ai.currency, CURRENCIES),
+      // Where the order is looked after, as opposed to productUrl, which is
+      // where the item itself lives. Same verbatim-link rule as every other
+      // address the model hands back.
+      manageUrl: pickUrl(ai.orderManageUrl, links),
     },
     imageUrl: pickUrl(ai.imageUrl, images),
     productUrl,
@@ -306,10 +339,7 @@ async function extractEmail(raw = {}, opts = {}) {
       // A mail states the return period either as a deadline or as a duration,
       // rarely both. Keep whichever it gave; working one out from the other
       // needs a delivery date and belongs to the caller, not here.
-      returns: {
-        returnBy: isoDate(ai.returnBy, year),
-        windowDays: intOrNull(ai.returnWindowDays, 1, MAX_RETURN_WINDOW_DAYS),
-      },
+      returns: returnPolicy(ai, year),
       subscription: null,
       // The prompt asks for the off-category facets to be null; enforce it here
       // rather than trusting it, so a stray value can't reach the database.
@@ -334,6 +364,13 @@ async function extractEmail(raw = {}, opts = {}) {
       currency: pick(ai.currency, CURRENCIES),
       billingCycle,
       plan: str(ai.plan),
+      // Which method pays for this, and the only part of the card that may be
+      // kept. Both are null unless the mail actually printed them.
+      paymentType: pick(ai.paymentType, PAYMENT_TYPES),
+      cardLast4: cardLast4(ai.cardLast4),
+      // The billing page, not an unsubscribe link — the prompt draws that line,
+      // and the link still has to be one the mail actually carried.
+      manageUrl: pickUrl(ai.subscriptionManageUrl, links),
     },
     filter: {
       orderCategory: null,
@@ -558,6 +595,49 @@ function intOrNull(v, lo, hi) {
   if (v == null || v === "") return null;
   const n = Math.round(Number(v));
   return isFinite(n) && n >= lo && n <= hi ? n : null;
+}
+
+/**
+ * The return policy as three fields that have to agree with each other.
+ *
+ * The model answers them independently, so an email can come back saying both
+ * "non-returnable" and "30 day returns". A stated *period* is the harder fact —
+ * it is a number read off the page — so it wins, and the type is only trusted
+ * to say "no returns" when nothing contradicts it. Left as stated otherwise,
+ * including the common case of a window with no policy word anywhere, which is
+ * what "returnable" means.
+ */
+function returnPolicy(ai, year) {
+  const returnBy = isoDate(ai.returnBy, year);
+  const windowDays = intOrNull(ai.returnWindowDays, 1, MAX_RETURN_WINDOW_DAYS);
+  const stated = pick(ai.returnType, RETURN_TYPES);
+
+  if (stated === "non_returnable" && !returnBy && !windowDays) {
+    // Nothing may be sent back, so there is no period to state either.
+    return { returnBy: null, windowDays: 0, type: "non_returnable" };
+  }
+
+  const type = stated === "non_returnable" ? "returnable" : stated;
+  return {
+    returnBy,
+    windowDays,
+    // A period on its own answers the question, so the field is filled far more
+    // often than the email uses the word.
+    type: type ?? ((returnBy || windowDays) ? "returnable" : null),
+  };
+}
+
+/**
+ * The last four digits of a card, and never one digit more.
+ *
+ * The prompt asks for four, but the model reads an untrusted email and a reply
+ * is not a promise — a mail that prints a full number could see it echoed back.
+ * Truncating here means a full card number cannot reach the database however
+ * the model behaves, which a whitelist on the prompt alone would not give.
+ */
+function cardLast4(v) {
+  const digits = String(v ?? "").replace(/\D/g, "");
+  return digits.length >= 4 ? digits.slice(-4) : null;
 }
 
 function pick(v, allowed) {

@@ -50,6 +50,47 @@ describe("recovering the key of a stored record", () => {
     );
   });
 
+  // The regression this whole identity rule exists for: the model wrote the
+  // same Anthropic receipt as "Anthropic" one sync and "Anthropic, PBC" the
+  // next, and each wording opened a subscription of its own.
+  it("keys a subscription by its brand domain, so a reworded merchant collapses", () => {
+    const short = keyFromData({
+      type: "subscription", merchant: "Anthropic", merchantDomain: "anthropic.com",
+    });
+    const legal = keyFromData({
+      type: "subscription", merchant: "Anthropic, PBC", merchantDomain: "anthropic.com",
+    });
+
+    assert.equal(short, "subscription:anthropic.com");
+    assert.equal(legal, short);
+  });
+
+  it("strips the legal suffix when there is no domain to key on", () => {
+    assert.equal(
+      keyFromData({ type: "subscription", merchant: "Anthropic, PBC" }),
+      "subscription:anthropic"
+    );
+    // Chained suffixes go too — only the suffixes, so any real word in the
+    // name survives and two genuinely different brands stay apart.
+    assert.equal(
+      keyFromData({ type: "subscription", merchant: "Spotify Technologies, Inc." }),
+      "subscription:spotify"
+    );
+  });
+
+  it("keeps a name that is nothing but a suffix rather than emptying it", () => {
+    assert.equal(keyFromData({ type: "subscription", merchant: "Ltd" }), "subscription:ltd");
+  });
+
+  it("keys an order by brand domain too, so a reworded merchant still merges", () => {
+    assert.equal(
+      keyFromData({
+        type: "order", merchant: "Shop, Inc.", merchantDomain: "shop.com", orderId: "ORD-1",
+      }),
+      "order:shop.com:ord-1"
+    );
+  });
+
   it("normalises case and surrounding space", () => {
     assert.equal(
       keyFromData({ type: "order", merchant: "  SHOP ", orderId: " Ord-1 " }),
@@ -178,6 +219,26 @@ describe("merging stored records with a fresh sync", () => {
     const merged = dedupeInsights([stored, fresh]);
     assert.equal(merged.length, 1);
     assert.equal(merged[0].data.status, "Delivered");
+  });
+
+  // End to end over the two steps that produced the duplicate: the stored copy
+  // and the fresh extraction are keyed from their own contents, then merged.
+  it("collapses a stored subscription onto a re-worded fresh one", () => {
+    const insight = (merchant, receivedAt) => {
+      const data = {
+        type: "subscription", merchant, merchantDomain: "anthropic.com", receivedAt,
+      };
+      return { sourceId: keyFromData(data), data };
+    };
+
+    const merged = dedupeInsights([
+      insight("Anthropic, PBC", "2026-08-13T08:55:35.000Z"),
+      insight("Anthropic", "2026-08-17T08:55:35.000Z"),
+    ]);
+
+    assert.equal(merged.length, 1);
+    assert.equal(merged[0].sourceId, "subscription:anthropic.com");
+    assert.equal(merged[0].data.merchant, "Anthropic");
   });
 
   it("leaves unrelated records alone", () => {

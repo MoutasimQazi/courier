@@ -59,11 +59,17 @@ const loadDevelopmentInsights = async () => {
 const saveDevelopmentInsights = () => saveJsonStore(developmentInsightsPath, developmentInsights);
 
 // Every stored document is written with the key it was grouped under, so it can
-// be merged with a freshly extracted one describing the same order. Documents
-// written before that field existed are recovered from their contents instead,
-// and anything that still cannot be identified keeps the id it was stored under
-// rather than being dropped.
-const storedSourceId = (documentId, data) => data?.sourceId || keyFromData(data) || documentId;
+// be merged with a freshly extracted one describing the same order.
+//
+// The key is *recomputed* from the contents rather than read back from the
+// field, because the rules that build it get fixed — grouping a subscription by
+// its brand domain instead of the model's wording of the merchant name, for
+// one. Documents written under a superseded rule have to answer to the current
+// key or they would sit alongside the record they belong to for ever, which is
+// exactly the duplicate this is here to prevent. The stored field is the
+// fallback for records with nothing stable to group on, and the id they were
+// stored under is the last resort, so nothing is ever dropped.
+const storedSourceId = (documentId, data) => keyFromData(data) || data?.sourceId || documentId;
 
 const sanitizeDocumentId = (value) => {
   const source = String(value || "");
@@ -190,8 +196,13 @@ class FirebaseService {
   async getStoredInsights(userId) {
     if (isDevelopmentUser(userId)) {
       const store = await loadDevelopmentInsights();
-      return Object.entries(store[userId] ?? {}).map(([sourceId, data]) => ({
-        sourceId: storedSourceId(sourceId, data),
+      return Object.entries(store[userId] ?? {}).map(([documentId, data]) => ({
+        sourceId: storedSourceId(documentId, data),
+        // Where this record physically lives, which is not where its current
+        // key says it belongs once that key has been recomputed. Carried so
+        // pruneRelocatedInsights can find the copy left behind.
+        documentId,
+        collection: data?.type === "order" ? "orders" : "subscriptions",
         data,
       }));
     }
@@ -203,10 +214,77 @@ class FirebaseService {
       user.collection("subscriptions").get(),
     ]);
 
-    return [...orders.docs, ...subscriptions.docs].map((document) => {
+    const entries = [
+      ...orders.docs.map((document) => ({ document, collection: "orders" })),
+      ...subscriptions.docs.map((document) => ({ document, collection: "subscriptions" })),
+    ];
+
+    return entries.map(({ document, collection }) => {
       const data = document.data();
-      return { sourceId: storedSourceId(document.id, data), data };
+      return {
+        sourceId: storedSourceId(document.id, data),
+        documentId: document.id,
+        collection,
+        data,
+      };
     });
+  }
+
+  /**
+   * Delete the documents that duplicates left behind.
+   *
+   * A document's id is a hash of the key it was written under, so a record
+   * whose key has been recomputed no longer answers to the id it is stored at:
+   * the merged version is written to the canonical id and the old one would
+   * linger for ever, resurfacing as a duplicate for any reader that does not
+   * recompute. This removes strictly those — a stored document is only deleted
+   * once the record it collapsed into has been written at its canonical id, so
+   * a record that simply was not re-extracted this run is left untouched.
+   */
+  async pruneRelocatedInsights(userId, stored = [], kept = []) {
+    if (stored.length === 0 || kept.length === 0) return 0;
+
+    const keptBySourceId = new Map(kept.map((insight) => [insight.sourceId, insight]));
+    // In the file-backed store a record is filed under the key itself; in
+    // Firestore under a hash of it.
+    const canonicalId = isDevelopmentUser(userId)
+      ? (sourceId) => sourceId
+      : sanitizeDocumentId;
+
+    const relocated = stored.filter((entry) => {
+      const survivor = keptBySourceId.get(entry.sourceId);
+      return survivor && canonicalId(survivor.sourceId) !== entry.documentId;
+    });
+    if (relocated.length === 0) return 0;
+
+    if (isDevelopmentUser(userId)) {
+      const store = await loadDevelopmentInsights();
+      const owned = store[userId] ?? (store[userId] = {});
+      for (const entry of relocated) {
+        const survivor = keptBySourceId.get(entry.sourceId);
+        owned[survivor.sourceId] = { ...survivor.data, sourceId: survivor.sourceId };
+        delete owned[entry.documentId];
+      }
+      await saveDevelopmentInsights();
+      return relocated.length;
+    }
+
+    const db = getFirestoreDb();
+    // Written before deleted, in that order: an interruption in between costs a
+    // stale copy that the next run prunes again, where the reverse would lose
+    // the record outright.
+    await this.#writeInsights(
+      userId,
+      relocated.map((entry) => keptBySourceId.get(entry.sourceId))
+    );
+    await Promise.all(relocated.map((entry) => (
+      db.collection("users").doc(userId)
+        .collection(entry.collection).doc(entry.documentId)
+        .delete()
+    )));
+
+    logger.info(`Pruned ${relocated.length} duplicate insight document(s) for ${userId}.`);
+    return relocated.length;
   }
 
   /**

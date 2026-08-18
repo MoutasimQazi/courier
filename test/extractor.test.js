@@ -529,10 +529,13 @@ describe("return windows", () => {
     assert.equal(data.returnWindowDays, 30);
   });
 
-  it("reports nothing when the mail mentions no return period", async () => {
+  // Zero, not null: the record always carries a number of days, so a client can
+  // print it without having to decide what "missing" means.
+  it("reports zero days when the mail mentions no return period", async () => {
     const data = await order({});
     assert.equal(data.returnBy, null);
-    assert.equal(data.returnWindowDays, null);
+    assert.equal(data.returnWindowDays, 0);
+    assert.equal(data.returnType, null);
     assert.equal(data.returnByIsEstimated, false);
   });
 
@@ -546,7 +549,7 @@ describe("return windows", () => {
   ]) {
     it(`ignores ${name}`, async () => {
       const data = await order({ returnBy: null, returnWindowDays: value });
-      assert.equal(data.returnWindowDays, null);
+      assert.equal(data.returnWindowDays, 0);
       assert.equal(data.returnBy, null);
     });
   }
@@ -563,6 +566,187 @@ describe("return windows", () => {
     });
     assert.equal(insight.data.returnBy, undefined);
     assert.equal(insight.data.returnWindowDays, undefined);
+  });
+});
+
+describe("what may be done with the item", () => {
+  const order = async (extra) => (await transformEmail(mail(), {
+    fetchImpl: reply({ ...COURIER, ...extra }),
+  })).data;
+
+  for (const type of ["returnable", "replaceable", "non_returnable"]) {
+    it(`keeps a stated policy of ${type}`, async () => {
+      const data = await order({ returnBy: null, returnWindowDays: null, returnType: type });
+      assert.equal(data.returnType, type);
+    });
+  }
+
+  it("drops a policy word outside the three the client understands", async () => {
+    const data = await order({ returnBy: null, returnWindowDays: null, returnType: "refundable" });
+    assert.equal(data.returnType, null);
+  });
+
+  // The far more common case: no email says "returnable", it just gives you a
+  // window. Leaving the field null there would make it useless.
+  it("reads a stated return period as returnable", async () => {
+    assert.equal((await order({ returnBy: null, returnWindowDays: 7 })).returnType, "returnable");
+    assert.equal((await order({ returnBy: "2026-09-05" })).returnType, "returnable");
+  });
+
+  it("zeroes the period when nothing may be sent back", async () => {
+    const data = await order({ returnBy: null, returnWindowDays: null, returnType: "non_returnable" });
+    assert.equal(data.returnType, "non_returnable");
+    assert.equal(data.returnWindowDays, 0);
+    assert.equal(data.returnBy, null);
+  });
+
+  // A model that says both is contradicting itself, and the number is the half
+  // that was actually read off the page.
+  it("believes a stated period over a contradicting 'no returns'", async () => {
+    const data = await order({ returnBy: null, returnWindowDays: 30, returnType: "non_returnable" });
+    assert.equal(data.returnType, "returnable");
+    assert.equal(data.returnWindowDays, 30);
+  });
+});
+
+describe("the order's own page", () => {
+  it("keeps a manage link the mail actually carried", async () => {
+    const insight = await transformEmail(mail(), {
+      fetchImpl: reply({
+        ...COURIER,
+        productUrl: null,
+        orderManageUrl: "https://shop.com/orders/ORD-1",
+      }),
+    });
+    assert.equal(insight.data.manageUrl, "https://shop.com/orders/ORD-1");
+    assert.equal(insight.data.productUrl, null, "the two links stay separate fields");
+  });
+
+  it("rejects a manage link that was never in the mail", async () => {
+    const insight = await transformEmail(mail(), {
+      fetchImpl: reply({ ...COURIER, orderManageUrl: "https://shop.com/orders/ORD-9" }),
+    });
+    assert.equal(insight.data.manageUrl, null);
+  });
+
+  it("leaves it null when the mail offers no such link", async () => {
+    const insight = await transformEmail(mail(), { fetchImpl: reply(COURIER) });
+    assert.equal(insight.data.manageUrl, null);
+  });
+});
+
+describe("gift cards", () => {
+  it("accepts gift_card as an order category", async () => {
+    const insight = await transformEmail(mail({ subject: "Your gift card" }), {
+      fetchImpl: reply({
+        ...COURIER,
+        orderName: "Amazon Gift Card",
+        trackingNumber: null, carrier: null, status: null, estimatedDelivery: null,
+        filter: { orderCategory: "gift_card" },
+      }),
+    });
+    assert.equal(insight.data.type, "order");
+    assert.equal(insight.data.category, "gift_card");
+  });
+
+  // An emailed card ships nothing, so the amount is the only evidence there is
+  // — the record must not be dropped for lacking a parcel.
+  it("keeps an emailed card that has no shipment at all", async () => {
+    const insight = await transformEmail(mail(), {
+      fetchImpl: reply({
+        ...COURIER,
+        orderNumber: null, trackingNumber: null, carrier: null,
+        status: null, estimatedDelivery: null,
+        amount: 2000, currency: "INR",
+        filter: { orderCategory: "gift_card" },
+      }),
+    });
+    assert.notEqual(insight, null);
+    assert.equal(insight.data.amount, 2000);
+  });
+});
+
+describe("how a subscription is paid", () => {
+  const BILLING_HTML = '<a href="https://netflix.com/account">Manage membership</a>'
+    + '<a href="https://netflix.com/unsubscribe">Unsubscribe</a>';
+
+  const subscription = async (extra) => (await transformEmail(
+    mail({ subject: "Your membership renews", body: BILLING_HTML }),
+    { fetchImpl: reply({ ...SUBSCRIPTION, ...extra }) }
+  )).data;
+
+  it("keeps the method and the last four digits", async () => {
+    const data = await subscription({ paymentType: "card", cardLast4: "4242" });
+    assert.equal(data.paymentType, "card");
+    assert.equal(data.cardLast4, "4242");
+  });
+
+  // The model reads an untrusted email, so a full number printed in the mail
+  // could come straight back. Only four digits may ever be stored, whatever it
+  // replies.
+  it("never stores more than the last four digits", async () => {
+    assert.equal((await subscription({ cardLast4: "4111 1111 1111 1234" })).cardLast4, "1234");
+    assert.equal((await subscription({ cardLast4: "**** **** **** 9876" })).cardLast4, "9876");
+    assert.equal((await subscription({ cardLast4: "ending in 4242" })).cardLast4, "4242");
+  });
+
+  it("keeps nothing when there are fewer than four digits to keep", async () => {
+    assert.equal((await subscription({ cardLast4: "42" })).cardLast4, null);
+    assert.equal((await subscription({ cardLast4: "Visa" })).cardLast4, null);
+    assert.equal((await subscription({ cardLast4: null })).cardLast4, null);
+  });
+
+  it("drops a payment method outside the enum", async () => {
+    assert.equal((await subscription({ paymentType: "bitcoin" })).paymentType, null);
+  });
+
+  it("keeps a billing page the mail carried", async () => {
+    const data = await subscription({ subscriptionManageUrl: "https://netflix.com/account" });
+    assert.equal(data.manageUrl, "https://netflix.com/account");
+  });
+
+  it("rejects a billing page that was never in the mail", async () => {
+    const data = await subscription({ subscriptionManageUrl: "https://netflix.com/billing" });
+    assert.equal(data.manageUrl, null);
+  });
+});
+
+describe("free trials", () => {
+  it("accepts trial as a subscription status", async () => {
+    const insight = await transformEmail(mail({ subject: "Your free trial has started" }), {
+      fetchImpl: reply({
+        ...SUBSCRIPTION,
+        trialEndsAt: "2026-08-27",
+        filter: { ...SUBSCRIPTION.filter, subscriptionStatus: "trial" },
+      }),
+    });
+    assert.equal(insight.data.subscriptionStatus, "trial");
+    assert.equal(insight.data.trialEndsAt, "2026-08-27");
+  });
+
+  // "Your trial has started" often states no amount, no cycle and no renewal
+  // date. The status is the fact, and the record has to survive on it alone.
+  it("keeps a trial notice that states nothing else", async () => {
+    const insight = await transformEmail(mail(), {
+      fetchImpl: reply({
+        ...SUBSCRIPTION,
+        amount: null, currency: null, billingCycle: null,
+        renewalDate: null, trialEndsAt: null,
+        filter: { ...SUBSCRIPTION.filter, subscriptionStatus: "trial", billingCycle: null },
+      }),
+    });
+    assert.notEqual(insight, null);
+    assert.equal(insight.data.subscriptionStatus, "trial");
+  });
+
+  it("drops a status outside the three the client understands", async () => {
+    const insight = await transformEmail(mail(), {
+      fetchImpl: reply({
+        ...SUBSCRIPTION,
+        filter: { ...SUBSCRIPTION.filter, subscriptionStatus: "trialling" },
+      }),
+    });
+    assert.equal(insight.data.subscriptionStatus, null);
   });
 });
 
