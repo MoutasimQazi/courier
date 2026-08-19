@@ -27,7 +27,7 @@ export const getForwardingStatus = async (req, res, next) => {
 export const syncForwarding = async (req, res, next) => {
   try {
     const result = await forwardingService.sync(req.user.uid);
-    return intelligenceResponse(res, result.orders, result.subscriptions, undefined, {
+    return intelligenceResponse(res, result, undefined, {
       scanned: result.scanned,
       accepted: result.accepted,
     });

@@ -54,6 +54,15 @@ const hasOrderEvidence = (parsed) => Boolean(
   || (parsed.order?.amount != null && parsed.order?.currency)
 );
 
+// An emailed card ships nothing, so the parcel half of hasOrderEvidence can
+// never fire for one. Its value, or the order it came from, is what makes it
+// real rather than an advertisement for gift cards.
+const hasGiftCardEvidence = (parsed) => Boolean(
+  parsed.order?.orderNumber
+  || parsed.shipping?.trackingNumber
+  || (parsed.order?.amount != null && parsed.order?.currency)
+);
+
 const hasSubscriptionEvidence = (parsed) => Boolean(
   parsed.subscription?.renewalDate
   || parsed.subscription?.trialEndsAt
@@ -108,17 +117,20 @@ const insightKey = (parsed, rawEmail) => {
   // record. See merchantIdentity().
   const merchant = merchantIdentity(parsed);
 
-  if (parsed.category === "courier") {
-    // The order number is the real identity; tracking number is the runner-up
-    // because one order can ship as several parcels.
-    const reference = parsed.order?.orderNumber ?? parsed.shipping?.trackingNumber;
-    if (merchant && reference) {
-      return `order:${merchant}:${String(reference).trim().toLowerCase()}`;
-    }
-  } else if (merchant) {
+  if (parsed.category === "subscription") {
     // One subscription per service. Renewals month after month are the same
     // subscription, so they must land on the same document.
-    return `subscription:${merchant}`;
+    if (merchant) return `subscription:${merchant}`;
+  } else {
+    // The order number is the real identity; tracking number is the runner-up
+    // because one order can ship as several parcels. A gift card is bought the
+    // same way, so it keys the same way — under its own prefix, so a card and
+    // an order that happen to share a reference stay separate records.
+    const reference = parsed.order?.orderNumber ?? parsed.shipping?.trackingNumber;
+    if (merchant && reference) {
+      const kind = parsed.category === "gift_card" ? "gift_card" : "order";
+      return `${kind}:${merchant}:${String(reference).trim().toLowerCase()}`;
+    }
   }
 
   return stableSourceId(rawEmail);
@@ -130,8 +142,14 @@ const insightKey = (parsed, rawEmail) => {
  * winner within a single sync would be whichever request happened to finish
  * last rather than whichever email is newest.
  */
-const trackingAlias = (data) => `${merchantIdentity(data) ?? ""}`
+// Scoped by type as well as merchant: an order and a gift card from the same
+// shop could otherwise share an alias and collapse into each other.
+const trackingAlias = (data) => `${data.type}:${merchantIdentity(data) ?? ""}`
   + `:${String(data.trackingId ?? "").trim().toLowerCase()}`;
+
+// Both are a purchase that can arrive as a parcel, so both key on an order or
+// tracking reference and both need the stream collapse below.
+const isPurchase = (data) => data.type === "order" || data.type === "gift_card";
 
 export const dedupeInsights = (insights) => {
   // Later updates about a parcel ("out for delivery", "delivered") often carry
@@ -140,13 +158,13 @@ export const dedupeInsights = (insights) => {
   // named it, so the whole stream lands on one record.
   const orderKeyByTracking = new Map();
   for (const { sourceId, data } of insights) {
-    if (data.type === "order" && data.orderId && data.trackingId) {
+    if (isPurchase(data) && data.orderId && data.trackingId) {
       orderKeyByTracking.set(trackingAlias(data), sourceId);
     }
   }
 
   const canonicalKey = ({ sourceId, data }) => (
-    data.type === "order" && !data.orderId && data.trackingId
+    isPurchase(data) && !data.orderId && data.trackingId
       ? orderKeyByTracking.get(trackingAlias(data)) ?? sourceId
       : sourceId
   );
@@ -240,6 +258,40 @@ const toOrder = (parsed) => {
   };
 };
 
+/**
+ * A gift card is a purchase, so it borrows the order fields that apply — who
+ * it is from, what it cost, and the parcel fields a posted card still needs.
+ *
+ * What it deliberately does not carry: the return fields, because a card is not
+ * sent back, and `category`, because gift cards are now a kind of their own
+ * rather than one bucket inside orders. The redemption code is never stored —
+ * the prompt refuses to return it, and nothing here would keep it if it did.
+ */
+const toGiftCard = (parsed) => ({
+  type: "gift_card",
+  merchant: parsed.merchant ?? null,
+  merchantDomain: parsed.merchantDomain ?? null,
+  productUrl: parsed.productUrl ?? null,
+  manageUrl: parsed.order?.manageUrl ?? null,
+  serviceUrl: parsed.serviceUrl ?? null,
+  logoUrl: parsed.logoUrl ?? null,
+  receivedAt: parsed.receivedAt ?? null,
+  emailId: parsed.emailId ?? null,
+  orderId: parsed.order?.orderNumber ?? null,
+  orderName: parsed.order?.orderName ?? null,
+  orderDate: parsed.order?.orderDate ?? null,
+  // The card's face value, not the price paid for it.
+  amount: parsed.order?.amount ?? null,
+  currency: parsed.order?.currency ?? null,
+  // Null throughout for an emailed card, which is the common case.
+  trackingId: parsed.shipping?.trackingNumber ?? null,
+  trackingUrl: parsed.shipping?.trackingUrl ?? null,
+  carrier: parsed.shipping?.carrier ?? null,
+  status: titleCase(parsed.shipping?.status),
+  deliveryDate: parsed.shipping?.estimatedDelivery ?? null,
+  imageUrl: parsed.imageUrl ?? null,
+});
+
 const toSubscription = (parsed) => ({
   type: "subscription",
   merchant: parsed.merchant ?? null,
@@ -284,6 +336,10 @@ const buildInsight = (rawEmail, parsed) => {
 
   if (parsed.category === "courier" && hasOrderEvidence(parsed)) {
     return { sourceId, data: toOrder(parsed) };
+  }
+
+  if (parsed.category === "gift_card" && hasGiftCardEvidence(parsed)) {
+    return { sourceId, data: toGiftCard(parsed) };
   }
 
   return null;
@@ -338,6 +394,7 @@ export const groupInsights = (insights) => {
   return {
     orders: insights.filter(({ data }) => data.type === "order").map(withKey),
     subscriptions: insights.filter(({ data }) => data.type === "subscription").map(withKey),
+    giftCards: insights.filter(({ data }) => data.type === "gift_card").map(withKey),
   };
 };
 

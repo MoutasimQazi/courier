@@ -29,10 +29,14 @@ export const errorResponse = (
   });
 };
 
+/**
+ * Takes the grouped result whole rather than one array per argument: there are
+ * three kinds now, and a fourth would again mean every call site counting
+ * positional arguments to reach `cursor`.
+ */
 export const intelligenceResponse = (
   res,
-  orders = [],
-  subscriptions = [],
+  { orders = [], subscriptions = [], giftCards = [] } = {},
   cursor = undefined,
   metadata = undefined
 ) => {
@@ -40,6 +44,7 @@ export const intelligenceResponse = (
     success: true,
     orders,
     subscriptions,
+    giftCards,
     ...(cursor !== undefined ? { pagination: { cursor } } : {}),
     ...(metadata !== undefined ? { metadata } : {}),
   });

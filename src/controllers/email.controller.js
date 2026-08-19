@@ -50,7 +50,7 @@ export const getEmails = async (req, res, next) => {
   try {
     const options = getRequestOptions(req);
     const result = await emailService.getEmails(options);
-    return intelligenceResponse(res, result.orders, result.subscriptions, result.cursor, result.diagnostics);
+    return intelligenceResponse(res, result, result.cursor, result.diagnostics);
   } catch (error) {
     return next(error);
   }
@@ -63,7 +63,7 @@ export const getEmailById = async (req, res, next) => {
       id: requiredString(req.params.id, "id"),
       userId: options.userId,
     });
-    return intelligenceResponse(res, result.orders, result.subscriptions);
+    return intelligenceResponse(res, result);
   } catch (error) {
     return next(error);
   }
@@ -73,7 +73,7 @@ export const syncEmails = async (req, res, next) => {
   try {
     const options = getRequestOptions(req);
     const result = await emailService.syncEmails(options);
-    return intelligenceResponse(res, result.orders, result.subscriptions, result.cursor, result.diagnostics);
+    return intelligenceResponse(res, result, result.cursor, result.diagnostics);
   } catch (error) {
     return next(error);
   }

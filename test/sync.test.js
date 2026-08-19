@@ -36,6 +36,30 @@ describe("recovering the key of a stored record", () => {
     );
   });
 
+  it("keys a gift card under its own prefix", () => {
+    assert.equal(
+      keyFromData({ type: "gift_card", merchantDomain: "amazon.in", orderId: "GC-1" }),
+      "gift_card:amazon.in:gc-1"
+    );
+  });
+
+  // Migration: before gift cards were their own type they were stored as
+  // orders with category "gift_card". Reading that old shape onto the new key
+  // is what lets the re-extracted record absorb the document it used to be.
+  it("reads a gift card stored as an order onto the gift card key", () => {
+    assert.equal(
+      keyFromData({ type: "order", category: "gift_card", merchantDomain: "ajio.com", orderId: "EUR-6EE" }),
+      "gift_card:ajio.com:eur-6ee"
+    );
+  });
+
+  it("leaves an ordinary order on the order key", () => {
+    assert.equal(
+      keyFromData({ type: "order", category: "groceries", merchantDomain: "bigbasket.com", orderId: "BNN-1" }),
+      "order:bigbasket.com:bnn-1"
+    );
+  });
+
   it("falls back to the tracking number when there is no order number", () => {
     assert.equal(
       keyFromData({ type: "order", merchant: "Shop", orderId: null, trackingId: "BD1" }),

@@ -193,6 +193,12 @@ class FirebaseService {
    * extraction would be. A sync merges these with what it newly found so the
    * response stays the full picture even when nothing new arrived.
    */
+  static #collectionFor(type) {
+    if (type === "order") return "orders";
+    if (type === "gift_card") return "giftCards";
+    return "subscriptions";
+  }
+
   async getStoredInsights(userId) {
     if (isDevelopmentUser(userId)) {
       const store = await loadDevelopmentInsights();
@@ -202,22 +208,19 @@ class FirebaseService {
         // key says it belongs once that key has been recomputed. Carried so
         // pruneRelocatedInsights can find the copy left behind.
         documentId,
-        collection: data?.type === "order" ? "orders" : "subscriptions",
+        collection: FirebaseService.#collectionFor(data?.type),
         data,
       }));
     }
 
     const db = getFirestoreDb();
     const user = db.collection("users").doc(userId);
-    const [orders, subscriptions] = await Promise.all([
-      user.collection("orders").get(),
-      user.collection("subscriptions").get(),
-    ]);
+    const names = ["orders", "subscriptions", "giftCards"];
+    const snapshots = await Promise.all(names.map((name) => user.collection(name).get()));
 
-    const entries = [
-      ...orders.docs.map((document) => ({ document, collection: "orders" })),
-      ...subscriptions.docs.map((document) => ({ document, collection: "subscriptions" })),
-    ];
+    const entries = snapshots.flatMap((snapshot, index) => (
+      snapshot.docs.map((document) => ({ document, collection: names[index] }))
+    ));
 
     return entries.map(({ document, collection }) => {
       const data = document.data();
@@ -405,7 +408,7 @@ class FirebaseService {
 
     for (const insight of insights) {
       const documentId = sanitizeDocumentId(insight.sourceId);
-      const collection = insight.data.type === "order" ? "orders" : "subscriptions";
+      const collection = FirebaseService.#collectionFor(insight.data.type);
       const reference = db.collection("users").doc(userId).collection(collection).doc(documentId);
       // The document id is a one-way hash of the key, so the key itself has to
       // be a field for a later sync to be able to merge onto this record.

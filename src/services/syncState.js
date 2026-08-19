@@ -70,10 +70,20 @@ export const keyFromData = (data) => {
   if (!data || typeof data !== "object") return null;
   const merchant = merchantIdentity(data);
 
-  if (data.type === "order") {
+  // Gift cards key exactly like orders, under their own prefix — mirroring the
+  // `kind` branch in insightKey().
+  if (data.type === "order" || data.type === "gift_card") {
+    // Gift cards were briefly stored as orders carrying the category
+    // "gift_card". They are a type of their own now, and their key moved with
+    // them. Reading the old shape onto the new key is what lets a re-extracted
+    // gift card absorb the order document it used to be, rather than the two
+    // sitting side by side in different collections.
+    const kind = data.type === "gift_card" || data.category === "gift_card"
+      ? "gift_card"
+      : "order";
     const reference = data.orderId ?? data.trackingId;
     if (merchant && reference) {
-      return `order:${merchant}:${String(reference).trim().toLowerCase()}`;
+      return `${kind}:${merchant}:${String(reference).trim().toLowerCase()}`;
     }
     return null;
   }

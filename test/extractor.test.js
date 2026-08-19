@@ -13,7 +13,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { extractEmail, extractEmails } from "../src/extractors/emailExtractor.js";
-import { dedupeInsights, transformEmail, transformEmails } from "../src/services/email.service.js";
+import { dedupeInsights, groupInsights, transformEmail, transformEmails } from "../src/services/email.service.js";
 
 process.env.DEEPSEEK_API_KEY = "test-key";
 
@@ -636,33 +636,104 @@ describe("the order's own page", () => {
 });
 
 describe("gift cards", () => {
-  it("accepts gift_card as an order category", async () => {
-    const insight = await transformEmail(mail({ subject: "Your gift card" }), {
-      fetchImpl: reply({
-        ...COURIER,
-        orderName: "Amazon Gift Card",
-        trackingNumber: null, carrier: null, status: null, estimatedDelivery: null,
-        filter: { orderCategory: "gift_card" },
-      }),
-    });
-    assert.equal(insight.data.type, "order");
-    assert.equal(insight.data.category, "gift_card");
+  const GIFT_CARD = {
+    ...COURIER,
+    category: "gift_card",
+    orderName: "Amazon Gift Card", items: [],
+    amount: 2000, currency: "INR",
+    trackingNumber: null, trackingUrl: null, carrier: null,
+    status: null, estimatedDelivery: null,
+    filter: {},
+  };
+
+  const card = async (extra) => (await transformEmail(
+    mail({ subject: "Your gift card" }),
+    { fetchImpl: reply({ ...GIFT_CARD, ...extra }) }
+  ));
+
+  it("is its own type, not an order", async () => {
+    const insight = await card();
+    assert.equal(insight.data.type, "gift_card");
+    assert.equal(insight.data.orderName, "Amazon Gift Card");
+    assert.equal(insight.data.amount, 2000);
   });
 
-  // An emailed card ships nothing, so the amount is the only evidence there is
-  // — the record must not be dropped for lacking a parcel.
+  it("keys itself apart from an order carrying the same reference", async () => {
+    const [giftCard, order] = await Promise.all([card(), transformEmail(mail(), {
+      fetchImpl: reply(COURIER),
+    })]);
+    assert.equal(giftCard.sourceId, "gift_card:shop.com:ord-1");
+    assert.equal(order.sourceId, "order:shop.com:ord-1");
+    assert.notEqual(giftCard.sourceId, order.sourceId);
+  });
+
+  // An emailed card ships nothing, so the parcel fields can never vouch for it
+  // — its value is the only evidence there is.
   it("keeps an emailed card that has no shipment at all", async () => {
-    const insight = await transformEmail(mail(), {
-      fetchImpl: reply({
-        ...COURIER,
-        orderNumber: null, trackingNumber: null, carrier: null,
-        status: null, estimatedDelivery: null,
-        amount: 2000, currency: "INR",
-        filter: { orderCategory: "gift_card" },
-      }),
-    });
+    const insight = await card({ orderNumber: null });
     assert.notEqual(insight, null);
     assert.equal(insight.data.amount, 2000);
+    assert.equal(insight.data.trackingId, null);
+    assert.equal(insight.data.deliveryDate, null);
+  });
+
+  it("drops one that states neither a value nor a reference", async () => {
+    assert.equal(await card({ orderNumber: null, amount: null, currency: null }), null);
+  });
+
+  // A posted card is a parcel like any other and keeps the shipping fields.
+  it("carries the parcel fields when the card is physically sent", async () => {
+    const insight = await card({
+      trackingNumber: "BD1", carrier: "Blue Dart",
+      status: "shipped", estimatedDelivery: "2026-08-18",
+      trackingUrl: "https://track.dhl.com/ABC123",
+    });
+    assert.equal(insight.data.trackingId, "BD1");
+    assert.equal(insight.data.status, "Shipped");
+    assert.equal(insight.data.deliveryDate, "2026-08-18");
+  });
+
+  it("carries no return fields, since a card is not sent back", async () => {
+    const insight = await card({ returnBy: "2026-09-05", returnWindowDays: 7, returnType: "returnable" });
+    assert.equal(insight.data.returnBy, undefined);
+    assert.equal(insight.data.returnWindowDays, undefined);
+    assert.equal(insight.data.returnType, undefined);
+  });
+
+  it("carries no filter facets, since it is a kind rather than a category", async () => {
+    const insight = await card({
+      filter: { orderCategory: "shopping", subscriptionStatus: "active" },
+    });
+    assert.equal(insight.data.category, undefined);
+    assert.equal(insight.data.subscriptionStatus, undefined);
+  });
+
+  it("no longer accepts gift_card as an order category", async () => {
+    const insight = await transformEmail(mail(), {
+      fetchImpl: reply({ ...COURIER, filter: { orderCategory: "gift_card" } }),
+    });
+    assert.equal(insight.data.type, "order");
+    assert.equal(insight.data.category, null);
+  });
+
+  it("lands in its own group, beside orders and subscriptions", () => {
+    const grouped = groupInsights([
+      { sourceId: "order:shop.com:1", data: { type: "order" } },
+      { sourceId: "subscription:netflix.com", data: { type: "subscription" } },
+      { sourceId: "gift_card:shop.com:2", data: { type: "gift_card" } },
+    ]);
+    assert.deepEqual(grouped.orders.map((e) => e.sourceId), ["order:shop.com:1"]);
+    assert.deepEqual(grouped.subscriptions.map((e) => e.sourceId), ["subscription:netflix.com"]);
+    assert.deepEqual(grouped.giftCards.map((e) => e.sourceId), ["gift_card:shop.com:2"]);
+  });
+
+  it("collapses repeat mail about one card onto a single record", () => {
+    const merged = dedupeInsights([
+      { sourceId: "gift_card:shop.com:g-1", data: { type: "gift_card", merchantDomain: "shop.com", orderId: "G-1", receivedAt: "2026-08-01T00:00:00Z" } },
+      { sourceId: "gift_card:shop.com:g-1", data: { type: "gift_card", merchantDomain: "shop.com", orderId: "G-1", receivedAt: "2026-08-05T00:00:00Z" } },
+    ]);
+    assert.equal(merged.length, 1);
+    assert.equal(merged[0].data.receivedAt, "2026-08-05T00:00:00Z");
   });
 });
 
@@ -747,6 +818,91 @@ describe("free trials", () => {
       }),
     });
     assert.equal(insight.data.subscriptionStatus, null);
+  });
+});
+
+describe("which links reach the model", () => {
+  // A real order mail leads with template chrome — nav, store badges, help
+  // centre — and puts the order link far below it. Keeping the first N in
+  // document order offered the model nothing but the chrome, and pickUrl only
+  // accepts a link that was offered, so manageUrl could never be filled.
+  const CHROME = [
+    ["https://www.shop.com/", "Shop logo"],
+    ["https://www.shop.com/deals", "Today's Deals"],
+    ["https://www.shop.com/c/electronics", "Electronics"],
+    ["https://www.shop.com/c/fashion", "Fashion"],
+    ["https://www.shop.com/c/home", "Home"],
+    ["https://www.shop.com/c/beauty", "Beauty"],
+    ["https://www.shop.com/c/toys", "Toys"],
+    ["https://www.shop.com/c/books", "Books"],
+    ["https://www.shop.com/c/grocery", "Grocery"],
+    ["https://apps.apple.com/app/shop", "Download on the App Store"],
+    ["https://play.google.com/store/apps/details?id=com.shop", "Get it on Google Play"],
+    ["https://www.shop.com/help", "Help Centre"],
+    ["https://www.shop.com/faq", "FAQ"],
+    ["https://www.shop.com/terms", "Terms of Use"],
+    ["https://www.shop.com/legal/privacy", "Privacy Notice"],
+    ["https://www.shop.com/about", "About us"],
+    ["https://www.shop.com/careers", "Careers"],
+    ["https://www.shop.com/blog", "Blog"],
+  ];
+
+  const MANAGE = "https://click.shopmail.com/u/?qs=aGVsbG8x";
+  const BURIED = [
+    [MANAGE, "View or manage your order"],
+    ["https://www.shop.com/gp/css/order-history", "Your Orders"],
+    ["https://www.shop.com/unsubscribe?u=1", "Unsubscribe"],
+  ];
+
+  const body = [...CHROME, ...BURIED]
+    .map(([href, label]) => `<a href="${href}">${label}</a>`)
+    .join("\n");
+
+  const buriedMail = () => mail({ body });
+
+  it("offers a buried order link ahead of the template chrome", async () => {
+    await transformEmail(buriedMail(), { fetchImpl: reply({ category: "none", confidence: 0 }) });
+    assert.ok(lastPrompt.includes(MANAGE), "the order link reached the model");
+    assert.ok(
+      lastPrompt.indexOf(MANAGE) < lastPrompt.indexOf("/c/electronics"),
+      "and it outranks the nav it was buried under"
+    );
+    assert.ok(!lastPrompt.includes("/blog"), "the least useful chrome is what gets dropped");
+  });
+
+  // Most transactional links are opaque click-tracker addresses. The text
+  // beside them is the only thing that says what they are.
+  it("shows the link text beside the address", async () => {
+    await transformEmail(buriedMail(), { fetchImpl: reply({ category: "none", confidence: 0 }) });
+    assert.ok(lastPrompt.includes(`View or manage your order -> ${MANAGE}`));
+  });
+
+  it("never offers an unsubscribe link", async () => {
+    await transformEmail(buriedMail(), { fetchImpl: reply({ category: "none", confidence: 0 }) });
+    assert.ok(!lastPrompt.includes("/unsubscribe"));
+  });
+
+  it("accepts the buried link back from the model", async () => {
+    const insight = await transformEmail(buriedMail(), {
+      fetchImpl: reply({ ...COURIER, imageUrl: null, productUrl: null, trackingUrl: null, orderManageUrl: MANAGE }),
+    });
+    assert.equal(insight.data.manageUrl, MANAGE);
+  });
+
+  // Ranking changes which links are offered, never the rule about what may be
+  // echoed back.
+  it("still rejects a link the mail never carried", async () => {
+    const insight = await transformEmail(buriedMail(), {
+      fetchImpl: reply({ ...COURIER, imageUrl: null, productUrl: null, trackingUrl: null, orderManageUrl: "https://click.shopmail.com/u/?qs=invented" }),
+    });
+    assert.equal(insight.data.manageUrl, null);
+  });
+
+  it("keeps document order between links that rank the same", async () => {
+    await transformEmail(mail({
+      body: `<a href="https://shop.com/a">One</a><a href="https://shop.com/b">Two</a>`,
+    }), { fetchImpl: reply({ category: "none", confidence: 0 }) });
+    assert.ok(lastPrompt.indexOf("shop.com/a") < lastPrompt.indexOf("shop.com/b"));
   });
 });
 

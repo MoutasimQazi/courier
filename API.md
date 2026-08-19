@@ -72,6 +72,7 @@ The backend resolves account IDs from the verified UID's Firestore record. The r
   "success": true,
   "orders": [],
   "subscriptions": [],
+  "giftCards": [],
   "pagination": {
     "cursor": null
   }
@@ -103,12 +104,34 @@ did not state it — never a guess.
 | `returnType` | `"returnable"` \| `"replaceable"` \| `"non_returnable"` \| `null` | A stated return period on its own reads as `returnable`. |
 | `returnWindowDays` | number | **`0` when no return period applies** — never null. |
 | `returnBy`, `returnByIsEstimated` | `YYYY-MM-DD`, boolean | The deadline, and whether it was counted forward from an estimated delivery rather than stated outright. |
-| `category` | enum | `shopping`, `electronics`, `fashion`, `groceries`, `pharmacy`, `food`, `gift_card`, `other`. |
+| `category` | enum | `shopping`, `electronics`, `fashion`, `groceries`, `pharmacy`, `food`, `other`. |
 | `receivedAt`, `emailId` | ISO timestamp, string | The email this version of the record came from. |
 
-`gift_card` covers a gift card, voucher, e-gift certificate, or top-up code —
-bought or received, physical or emailed. An emailed card ships nothing, so those
-records carry no tracking or delivery fields.
+### Gift card records
+
+Gift cards are their own kind, returned in `giftCards` rather than mixed into
+`orders`, and stored in their own `giftCards` collection.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `sourceId` | string | `gift_card:<domain>:<reference>` — the prefix keeps a card and an order sharing a reference apart. |
+| `type` | `"gift_card"` | |
+| `merchant`, `merchantDomain` | string | The brand the card is spent at. |
+| `orderId`, `orderName`, `orderDate` | string, string, `YYYY-MM-DD` | |
+| `amount`, `currency` | number, ISO code | The card's face value, not the price paid for it. |
+| `trackingId`, `trackingUrl`, `carrier`, `status`, `deliveryDate` | | A posted card is a parcel like any other. All null for an emailed card, which is the common case. |
+| `manageUrl`, `productUrl`, `serviceUrl`, `logoUrl`, `imageUrl` | URL | |
+| `receivedAt`, `emailId` | ISO timestamp, string | |
+
+Covers a gift card, voucher, e-gift certificate, or store credit — bought or
+received, physical or emailed. There are deliberately no return fields (a card
+is not sent back) and no `category` (the kind *is* the category). The redemption
+code is never extracted or stored: it is a bearer credential, and the prompt
+refuses to return it.
+
+An offer *of* a gift card ("win a ₹500 voucher") is marketing and is not
+captured, and a gift card bought as one line of a larger order stays with that
+order.
 
 ### Subscription records
 
