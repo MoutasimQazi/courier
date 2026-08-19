@@ -143,7 +143,9 @@ order.
 | `orderName`, `plan` | string | The service and plan in plain words. |
 | `amount`, `currency` | number, ISO code | |
 | `billingCycle` | `weekly` \| `monthly` \| `quarterly` \| `yearly` | |
-| `renewalDate`, `trialEndsAt` | `YYYY-MM-DD` | |
+| `renewalDate` | `YYYY-MM-DD` | The **next** charge. Derived from the billing cycle when the email printed no future date; see below. |
+| `renewalDateIsEstimated` | boolean | True when the date was worked out rather than stated. |
+| `trialEndsAt` | `YYYY-MM-DD` | |
 | `subscriptionStatus` | `"active"` \| `"trial"` \| `"cancelled"` \| `null` | `trial` means a free trial that has not yet been charged; it becomes `active` once it converts. |
 | `paymentType` | enum \| `null` | `card`, `upi`, `netbanking`, `wallet`, `paypal`, `apple_pay`, `google_pay`, `bank_transfer`, `other`. |
 | `cardLast4` | string \| `null` | The last four digits only — never more, whatever the email printed. |
@@ -154,6 +156,20 @@ order.
 
 Filter free trials on `subscriptionStatus === "trial"`; `trialEndsAt` carries the
 date when the email gave one.
+
+**How `renewalDate` is worked out.** Most billing mail never prints a future
+date: a receipt says what was just taken, and a renewal notice often names the
+date the plan *last* renewed. So the next charge is projected from the last one
+plus the billing cycle, anchored on the first of these the email gave — the date
+it stated, the date the payment was taken, or the day the mail arrived. A stated
+date already in the past is rolled forward by whole cycles. During a trial, the
+next charge is `trialEndsAt`.
+
+Two cases stay empty on purpose: a **cancelled** plan has no next charge (its
+stated date is reported as-is, unrolled), and a plan with **no known billing
+cycle** cannot be projected — a guessed date in the past is worse than a blank
+field. Rolling stops at the email's own date, not today's, so a record reads the
+same every time rather than drifting.
 
 ### One email
 

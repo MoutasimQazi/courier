@@ -906,6 +906,103 @@ describe("which links reach the model", () => {
   });
 });
 
+describe("when the next charge falls", () => {
+  const sub = async (extra, at = "2026-08-17T08:55:35Z") => (await transformEmail(
+    mail({ date: at }),
+    { fetchImpl: reply({ ...SUBSCRIPTION, renewalDate: null, ...extra }) }
+  )).data;
+
+  it("keeps a stated date that is still ahead", async () => {
+    const data = await sub({ renewalDate: "2026-09-01" });
+    assert.equal(data.renewalDate, "2026-09-01");
+    assert.equal(data.renewalDateIsEstimated, false);
+  });
+
+  // The three real cases this was written for. Each came back with a date a
+  // person could not act on: null, or one already in the past.
+  it("projects the next charge when the mail states none", async () => {
+    const data = await sub({ billingCycle: "monthly", orderDate: "2026-08-17" });
+    assert.equal(data.renewalDate, "2026-09-17");
+    assert.equal(data.renewalDateIsEstimated, true);
+  });
+
+  it("rolls a stated date that has already passed forward by whole cycles", async () => {
+    const data = await sub({ renewalDate: "2026-06-09", billingCycle: "yearly" });
+    assert.equal(data.renewalDate, "2027-06-09");
+    assert.equal(data.renewalDateIsEstimated, true);
+  });
+
+  it("falls back to the day the mail arrived when it names no charge date", async () => {
+    const data = await sub({ billingCycle: "monthly", orderDate: null });
+    assert.equal(data.renewalDate, "2026-09-17");
+    assert.equal(data.renewalDateIsEstimated, true);
+  });
+
+  it("uses the trial end as the next charge", async () => {
+    const data = await sub({
+      billingCycle: "monthly", trialEndsAt: "2026-08-31",
+      filter: { ...SUBSCRIPTION.filter, subscriptionStatus: "trial" },
+    });
+    assert.equal(data.renewalDate, "2026-08-31");
+    assert.equal(data.renewalDateIsEstimated, true);
+  });
+
+  // Two cases where inventing a date would be worse than leaving it empty.
+  it("projects nothing for a cancelled plan", async () => {
+    const data = await sub({
+      billingCycle: "monthly",
+      filter: { ...SUBSCRIPTION.filter, subscriptionStatus: "cancelled" },
+    });
+    assert.equal(data.renewalDate, null);
+    assert.equal(data.renewalDateIsEstimated, false);
+  });
+
+  it("projects nothing when the cycle is unknown", async () => {
+    const data = await sub({ billingCycle: null, orderDate: "2026-08-17" });
+    assert.equal(data.renewalDate, null);
+    assert.equal(data.renewalDateIsEstimated, false);
+  });
+
+  it("reports a cancelled plan's last date exactly as stated", async () => {
+    const data = await sub({
+      renewalDate: "2026-06-09", billingCycle: "yearly",
+      filter: { ...SUBSCRIPTION.filter, subscriptionStatus: "cancelled" },
+    });
+    assert.equal(data.renewalDate, "2026-06-09");
+    assert.equal(data.renewalDateIsEstimated, false);
+  });
+
+  for (const [cycle, expected] of [
+    ["weekly", "2026-08-24"],
+    ["monthly", "2026-09-17"],
+    ["quarterly", "2026-11-17"],
+    ["yearly", "2027-08-17"],
+  ]) {
+    it(`steps a ${cycle} plan by one cycle`, async () => {
+      assert.equal((await sub({ billingCycle: cycle, orderDate: "2026-08-17" })).renewalDate, expected);
+    });
+  }
+
+  // setUTCMonth on a 31st overflows into the month after next: 31 January plus
+  // one month is 3 March, and every charge would land in the wrong month.
+  it("clamps a month-end charge instead of overflowing", async () => {
+    const data = await sub({ billingCycle: "monthly", orderDate: "2026-01-31" }, "2026-01-31T00:00:00Z");
+    assert.equal(data.renewalDate, "2026-02-28");
+  });
+
+  it("clamps to a leap day", async () => {
+    const data = await sub({ billingCycle: "yearly", orderDate: "2024-02-29" }, "2024-02-29T00:00:00Z");
+    assert.equal(data.renewalDate, "2025-02-28");
+  });
+
+  // Rolling stops at the email's own date, not today's, so the record reads the
+  // same every time rather than drifting under the client.
+  it("rolls relative to the mail, not to now", async () => {
+    const data = await sub({ renewalDate: "2020-03-15", billingCycle: "yearly" }, "2026-08-17T00:00:00Z");
+    assert.equal(data.renewalDate, "2027-03-15");
+  });
+});
+
 describe("batch runner", () => {
   it("keeps results aligned and collects failures", async () => {
     const errors = [];

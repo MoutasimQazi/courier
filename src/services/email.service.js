@@ -267,6 +267,104 @@ const toOrder = (parsed) => {
  * rather than one bucket inside orders. The redemption code is never stored —
  * the prompt refuses to return it, and nothing here would keep it if it did.
  */
+// Whole months per cycle. Weekly is days, so it is handled separately.
+const CYCLE_MONTHS = { monthly: 1, quarterly: 3, yearly: 12 };
+// A weekly plan billed for two years is ~104 steps; the bound only exists so a
+// bad date can never spin here.
+const MAX_CYCLE_STEPS = 400;
+
+const isoDay = (date) => date.toISOString().slice(0, 10);
+
+/**
+ * One billing cycle forward from a YYYY-MM-DD date.
+ *
+ * Month arithmetic is done on day 1 and then clamped, because setUTCMonth on a
+ * 31st overflows: 31 January plus one month is 3 March in JavaScript, and the
+ * charge would land in the wrong month every time.
+ */
+const advanceCycle = (day, cycle) => {
+  const date = new Date(`${day}T00:00:00Z`);
+  if (isNaN(date.getTime())) return null;
+
+  if (cycle === "weekly") {
+    date.setUTCDate(date.getUTCDate() + 7);
+    return isoDay(date);
+  }
+
+  const months = CYCLE_MONTHS[cycle];
+  if (!months) return null;
+
+  const dayOfMonth = date.getUTCDate();
+  date.setUTCDate(1);
+  date.setUTCMonth(date.getUTCMonth() + months);
+  const lastOfMonth = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0)).getUTCDate();
+  date.setUTCDate(Math.min(dayOfMonth, lastOfMonth));
+  return isoDay(date);
+};
+
+// Step forward until the date is past `after`, so a charge date becomes the
+// *next* one rather than one that has already happened.
+const advancePast = (day, cycle, after) => {
+  let next = day;
+  for (let i = 0; next && next <= after && i < MAX_CYCLE_STEPS; i += 1) {
+    next = advanceCycle(next, cycle);
+  }
+  return next && next > after ? next : null;
+};
+
+/**
+ * The date of the next charge.
+ *
+ * Most billing mail never prints one. A receipt says what was just taken and
+ * how often it recurs, and a renewal notice often names the date the plan
+ * *last* renewed — which is why every subscription came back with either a null
+ * renewalDate or one already in the past, neither of which a person can act on.
+ *
+ * So the next charge is worked out from the last one plus the billing cycle,
+ * anchored on whichever of these the email gave: the date it stated, the date
+ * the payment was taken, or failing both, the day the mail arrived — a receipt
+ * arrives when the charge is made, so that is a fair stand-in.
+ *
+ * Everything derived is flagged, and two cases are deliberately left alone: a
+ * cancelled plan has no next charge, and a plan with no stated cycle cannot be
+ * projected at all — a guessed date in the past is worse than an empty field.
+ *
+ * Rolling stops relative to the email's own date, not today's, so a record is
+ * the same every time it is read rather than drifting under the client.
+ */
+const nextRenewal = (parsed) => {
+  const stated = parsed.subscription?.renewalDate ?? null;
+  const cycle = parsed.subscription?.billingCycle ?? null;
+  const received = (parsed.receivedAt ?? "").slice(0, 10) || null;
+
+  // Nothing recurs after a cancellation. Whatever date the mail gave is the
+  // last one, and it is reported exactly as stated.
+  if (parsed.filter?.subscriptionStatus === "cancelled") {
+    return { renewalDate: stated, estimated: false };
+  }
+
+  if (stated) {
+    if (!cycle || !received || stated > received) {
+      return { renewalDate: stated, estimated: false };
+    }
+    // A stated date that has already passed is the previous renewal; the next
+    // one is a whole number of cycles after it.
+    const rolled = advancePast(stated, cycle, received);
+    return rolled ? { renewalDate: rolled, estimated: true } : { renewalDate: stated, estimated: false };
+  }
+
+  // During a trial the next charge is the day the trial converts, which the
+  // mail states far more often than it states a renewal date.
+  const trialEndsAt = parsed.subscription?.trialEndsAt ?? null;
+  if (trialEndsAt) return { renewalDate: trialEndsAt, estimated: true };
+
+  const anchor = parsed.order?.orderDate ?? received;
+  if (!anchor || !cycle) return { renewalDate: null, estimated: false };
+
+  const projected = advancePast(anchor, cycle, received ?? anchor);
+  return projected ? { renewalDate: projected, estimated: true } : { renewalDate: null, estimated: false };
+};
+
 const toGiftCard = (parsed) => ({
   type: "gift_card",
   merchant: parsed.merchant ?? null,
@@ -292,34 +390,41 @@ const toGiftCard = (parsed) => ({
   imageUrl: parsed.imageUrl ?? null,
 });
 
-const toSubscription = (parsed) => ({
-  type: "subscription",
-  merchant: parsed.merchant ?? null,
-  merchantDomain: parsed.merchantDomain ?? null,
-  orderName: parsed.order?.orderName ?? null,
-  imageUrl: parsed.imageUrl ?? null,
-  // The service's own page, and a logo derived from its domain. manageUrl is
-  // the billing page behind it — where the plan is changed or cancelled, which
-  // is the one link a person actually needs from a renewal notice.
-  serviceUrl: parsed.serviceUrl ?? null,
-  manageUrl: parsed.subscription?.manageUrl ?? null,
-  logoUrl: parsed.logoUrl ?? null,
-  receivedAt: parsed.receivedAt ?? null,
-  emailId: parsed.emailId ?? null,
-  plan: extractPlan(parsed),
-  amount: parsed.subscription?.amount ?? null,
-  currency: parsed.subscription?.currency ?? null,
-  billingCycle: parsed.subscription?.billingCycle ?? null,
-  renewalDate: parsed.subscription?.renewalDate ?? null,
-  trialEndsAt: parsed.subscription?.trialEndsAt ?? null,
-  // How the charge is paid, and the only part of the card that is ever kept —
-  // the last four digits, which is what a person recognises the card by.
-  paymentType: parsed.subscription?.paymentType ?? null,
-  cardLast4: parsed.subscription?.cardLast4 ?? null,
-  // Filter facets, stored raw so the client can match on them.
-  category: parsed.filter?.subscriptionCategory ?? null,
-  subscriptionStatus: parsed.filter?.subscriptionStatus ?? null,
-});
+const toSubscription = (parsed) => {
+  const renewal = nextRenewal(parsed);
+
+  return {
+    type: "subscription",
+    merchant: parsed.merchant ?? null,
+    merchantDomain: parsed.merchantDomain ?? null,
+    orderName: parsed.order?.orderName ?? null,
+    imageUrl: parsed.imageUrl ?? null,
+    // The service's own page, and a logo derived from its domain. manageUrl is
+    // the billing page behind it — where the plan is changed or cancelled, which
+    // is the one link a person actually needs from a renewal notice.
+    serviceUrl: parsed.serviceUrl ?? null,
+    manageUrl: parsed.subscription?.manageUrl ?? null,
+    logoUrl: parsed.logoUrl ?? null,
+    receivedAt: parsed.receivedAt ?? null,
+    emailId: parsed.emailId ?? null,
+    plan: extractPlan(parsed),
+    amount: parsed.subscription?.amount ?? null,
+    currency: parsed.subscription?.currency ?? null,
+    billingCycle: parsed.subscription?.billingCycle ?? null,
+    // The next charge, not the last one — worked out from the billing cycle when
+    // the mail did not print a future date, and flagged when it was.
+    renewalDate: renewal.renewalDate,
+    renewalDateIsEstimated: renewal.estimated,
+    trialEndsAt: parsed.subscription?.trialEndsAt ?? null,
+    // How the charge is paid, and the only part of the card that is ever kept —
+    // the last four digits, which is what a person recognises the card by.
+    paymentType: parsed.subscription?.paymentType ?? null,
+    cardLast4: parsed.subscription?.cardLast4 ?? null,
+    // Filter facets, stored raw so the client can match on them.
+    category: parsed.filter?.subscriptionCategory ?? null,
+    subscriptionStatus: parsed.filter?.subscriptionStatus ?? null,
+  };
+};
 
 // Pure mapping step, kept separate from the model call so the batch path can
 // parse with bounded concurrency and then shape the results synchronously.
